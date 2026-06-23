@@ -178,22 +178,18 @@ async fn tor_dial_with_retry(
     host: &str,
 ) -> Result<DataStream, Error> {
     let deadline = tokio::time::Instant::now() + TOR_DIAL_TOTAL_TIMEOUT;
-    let mut last_err = Error::ConnectionClosed;
 
     loop {
         match tor.connect(host, tor::TOR_VIRTUAL_PORT).await {
             Ok(ds) => return Ok(ds),
             Err(e) => {
-                last_err = e;
                 if tokio::time::Instant::now() + TOR_DIAL_RETRY_DELAY > deadline {
-                    break; // tidak cukup waktu untuk retry lagi
+                    return Err(e); // waktu habis — kembalikan error terakhir
                 }
                 tokio::time::sleep(TOR_DIAL_RETRY_DELAY).await;
             }
         }
     }
-
-    Err(last_err)
 }
 
 
