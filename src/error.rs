@@ -40,4 +40,8 @@ pub enum Error {
     /// Remote static key tidak cocok dengan kontak yang diharapkan — fail closed.
     #[error("peer identity mismatch")]
     IdentityMismatch,
+
+    /// Kedua sisi gagal menyepakati role (Initiator/Responder) saat negosiasi.
+    #[error("role negotiation failed")]
+    RoleNegotiationFailed,
 }

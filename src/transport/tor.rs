@@ -10,6 +10,7 @@
 //! dibuat sekali saat startup bila flag `--tor` aktif.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use arti_client::config::CfgPath;
 use arti_client::{DataStream, TorClient, TorClientConfig};
@@ -114,5 +115,12 @@ impl TorContext {
     pub async fn accept(&self) -> Option<DataStream> {
         let mut rx = self.incoming.lock().await;
         rx.recv().await
+    }
+
+    /// Seperti `accept`, tapi berhenti setelah `timeout` jika tidak ada koneksi masuk.
+    /// Mengembalikan `None` bila waktu habis atau channel tertutup.
+    pub async fn accept_timeout(&self, timeout: Duration) -> Option<DataStream> {
+        let mut rx = self.incoming.lock().await;
+        tokio::time::timeout(timeout, rx.recv()).await.ok().flatten()
     }
 }
