@@ -143,6 +143,8 @@ pub(crate) struct App {
     pub keys: Option<SelfKeys>,
     pub vault_path: PathBuf,
     pub tor: Option<Arc<TorContext>>,
+    /// True selama bootstrap Tor berjalan di latar belakang (untuk indikator UI).
+    pub tor_connecting: bool,
     pub connect_kind: ConnectKind,
 
     pub screen: Screen,
@@ -191,6 +193,7 @@ impl App {
             keys: None,
             vault_path,
             tor: None,
+            tor_connecting: false,
             connect_kind,
             screen,
             splash_ticks: 0,
@@ -270,6 +273,12 @@ pub async fn run(
     let mut app = App::new(vault_path, vault_exists, connect_kind, contacts);
     app.screen = Screen::Splash; // selalu mulai dari splash
 
+    // Tandai Tor sedang bootstrap (untuk indikator "tor·…" di header).
+    if tor_rx.is_some() {
+        app.tor_connecting = true;
+        app.set_notif_info("Menyambung ke Tor di latar belakang (~30-60 dtk)…");
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -321,6 +330,7 @@ pub async fn run(
                     }
                     None => {}
                 }
+                app.tor_connecting = false;
                 tor_rx = None;
             }
             _ = tick.tick() => {

@@ -299,11 +299,14 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         .map(|k| format_fingerprint_short(&k.fingerprint))
         .unwrap_or_default();
 
-    // Segmen 1: transport
-    let (transport_label, transport_color) = if app.tor_active() {
-        ("tor", ACCENT)
+    // Segmen 1: transport (lan / tor menyambung / tor siap)
+    let (transport_label, transport_color): (String, _) = if app.tor_active() {
+        ("tor".to_string(), ACCENT)
+    } else if app.tor_connecting {
+        let spinner = SPINNER[(app.tick_count % SPINNER_LEN) as usize];
+        (format!("tor {spinner}"), WARNING)
     } else {
-        ("lan", DIM)
+        ("lan".to_string(), DIM)
     };
 
     // Segmen 2: status sesi / notifikasi
@@ -773,10 +776,12 @@ fn render_invite_popup(f: &mut Frame, app: &App, area: Rect) {
     )));
     if !app.tor_active() {
         text.push(Line::from(""));
-        text.push(Line::from(Span::styled(
-            "(LAN-only. Jalankan --tor untuk menyertakan onion address.)",
-            Style::default().fg(DIM),
-        )));
+        let note = if app.tor_connecting {
+            "Tor sedang menyambung… onion address akan muncul di invite saat siap."
+        } else {
+            "(LAN-only — mode --offline. Tanpa --offline, invite otomatis menyertakan onion.)"
+        };
+        text.push(Line::from(Span::styled(note, Style::default().fg(DIM))));
     }
     text.push(Line::from(""));
     text.push(Line::from(Span::styled(
