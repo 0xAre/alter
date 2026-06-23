@@ -290,26 +290,33 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         .collect();
     f.render_widget(Paragraph::new(logo_lines), vrows[0]);
 
-    // ── Status bar (1 baris penuh): • transport • status • fp ───────────────────
-    let dot = || Span::styled(" • ", Style::default().fg(DIM));
-
+    // ── Status bar: [pill transport]   <status sesi>            fingerprint ──────
     let fp_short = app
         .keys
         .as_ref()
         .map(|k| format_fingerprint_short(&k.fingerprint))
         .unwrap_or_default();
 
-    // Segmen 1: transport (lan / tor menyambung / tor siap)
-    let (transport_label, transport_color): (String, _) = if app.tor_active() {
-        ("tor".to_string(), ACCENT)
+    // Transport sebagai PILL (reverse-video) — tampak modern, bukan teks polos.
+    let pill = |label: String, bg: Color| {
+        Span::styled(
+            label,
+            Style::default()
+                .fg(Color::Black)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let transport_pill: Span = if app.tor_active() {
+        pill(" ⬡ TOR ".to_string(), ACCENT)
     } else if app.tor_connecting {
         let spinner = SPINNER[(app.tick_count % SPINNER_LEN) as usize];
-        (format!("tor {spinner}"), WARNING)
+        pill(format!(" ⬡ TOR {spinner} "), WARNING)
     } else {
-        ("lan".to_string(), DIM)
+        pill(" LAN ".to_string(), Color::Gray)
     };
 
-    // Segmen 2: status sesi / notifikasi
+    // Status sesi / notifikasi — pakai dot berwarna semantik.
     let status_span: Span = if let Some(notif) = &app.notification {
         let color = match notif.level {
             NotifLevel::Error => ERROR,
@@ -320,7 +327,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(notif.text.clone(), Style::default().fg(color))
     } else {
         match app.room {
-            RoomState::None => Span::styled("online", Style::default().fg(DIM)),
+            RoomState::None => Span::styled("○ idle", Style::default().fg(DIM)),
             RoomState::Connecting | RoomState::Handshaking => {
                 let spinner = SPINNER[(app.tick_count % SPINNER_LEN) as usize];
                 Span::styled(
@@ -338,19 +345,25 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         }
     };
 
-    // Segmen 3: fingerprint (kanan)
-    let fp_span = Span::styled(fp_short, Style::default().fg(DIM));
+    // Kiri (pill + status) | kanan (fingerprint, rata kanan).
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(10), Constraint::Length(16)])
+        .split(vrows[1]);
 
-    let status_line = Line::from(vec![
-        Span::styled(" ", Style::default()),
-        dot(),
-        Span::styled(transport_label, Style::default().fg(transport_color)),
-        dot(),
+    let left = Line::from(vec![
+        Span::raw(" "),
+        transport_pill,
+        Span::raw("   "),
         status_span,
-        dot(),
-        fp_span,
     ]);
-    f.render_widget(Paragraph::new(status_line), vrows[1]);
+    f.render_widget(Paragraph::new(left), cols[0]);
+
+    let right = Line::from(Span::styled(
+        format!("{fp_short} "),
+        Style::default().fg(DIM),
+    ));
+    f.render_widget(Paragraph::new(right).alignment(Alignment::Right), cols[1]);
 }
 
 // ─────────────────────────────── Contacts ─────────────────────────────────────
