@@ -14,7 +14,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use arti_client::DataStream;
-use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
@@ -47,14 +47,11 @@ pub enum LanMode {
     Off,
 }
 
-/// Koneksi transport: TCP (LAN), DataStream (Tor), atau DuplexStream (channel
-/// bridge dipakai setelah role negotiation agar DataStream bisa di-unsplit).
+/// Koneksi transport: TCP (LAN) atau DataStream (Tor). Keduanya
+/// mengimplementasikan tokio AsyncRead/AsyncWrite, didelegasikan di bawah.
 pub enum Conn {
     Tcp(TcpStream),
     Tor(DataStream),
-    /// Channel bridge: dihasilkan oleh `negotiate_role` untuk membungkus
-    /// sepasang ReadHalf/WriteHalf DataStream yang tidak bisa di-unsplit langsung.
-    Duplex(DuplexStream),
 }
 
 impl AsyncRead for Conn {
@@ -66,7 +63,6 @@ impl AsyncRead for Conn {
         match self.get_mut() {
             Conn::Tcp(s) => Pin::new(s).poll_read(cx, buf),
             Conn::Tor(s) => Pin::new(s).poll_read(cx, buf),
-            Conn::Duplex(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -80,7 +76,6 @@ impl AsyncWrite for Conn {
         match self.get_mut() {
             Conn::Tcp(s) => Pin::new(s).poll_write(cx, buf),
             Conn::Tor(s) => Pin::new(s).poll_write(cx, buf),
-            Conn::Duplex(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -88,7 +83,6 @@ impl AsyncWrite for Conn {
         match self.get_mut() {
             Conn::Tcp(s) => Pin::new(s).poll_flush(cx),
             Conn::Tor(s) => Pin::new(s).poll_flush(cx),
-            Conn::Duplex(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -96,7 +90,6 @@ impl AsyncWrite for Conn {
         match self.get_mut() {
             Conn::Tcp(s) => Pin::new(s).poll_shutdown(cx),
             Conn::Tor(s) => Pin::new(s).poll_shutdown(cx),
-            Conn::Duplex(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -109,18 +102,20 @@ fn role_from_fp(my_fp: &str, target_fp: &str) -> Role {
     }
 }
 
-/// Byte yang dikirim saat role negotiation untuk menunjukkan preferensi role.
-const ROLE_HINT_INITIATOR: u8 = 0x49; // 'I'
-const ROLE_HINT_RESPONDER: u8 = 0x52; // 'R'
+/// Timeout total untuk Initiator mencoba dial .onion peer (dengan retry).
+const TOR_DIAL_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Timeout menunggu koneksi Tor masuk (sisi Responder dalam symmetric connect).
-const TOR_ACCEPT_TIMEOUT: Duration = Duration::from_secs(90);
+/// Delay antar retry dial Tor.
+const TOR_DIAL_RETRY_DELAY: Duration = Duration::from_secs(8);
+
+/// Timeout Responder menunggu koneksi masuk dari Initiator via Tor.
+const TOR_ACCEPT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Bangun koneksi ke peer dengan fallback LAN-first → Tor.
 ///
 /// - `lan`: mode jalur LAN.
 /// - `onion`: onion address peer (untuk fallback Tor); None bila kontak LAN-only.
-/// - `tor`: konteks Tor aktif (None bila `--tor` tidak diaktifkan).
+/// - `tor`: konteks Tor aktif (None bila online).
 pub async fn establish(
     my_fp: &str,
     target_fp: &str,
@@ -128,7 +123,7 @@ pub async fn establish(
     onion: Option<&str>,
     tor: Option<&Arc<TorContext>>,
 ) -> Result<(Conn, Role), Error> {
-    let lan_role = match lan {
+    let role = match lan {
         LanMode::Dial(_) => Role::Initiator,
         LanMode::Listen(_) => Role::Responder,
         LanMode::Auto | LanMode::Off => role_from_fp(my_fp, target_fp),
@@ -144,8 +139,8 @@ pub async fn establish(
             LanMode::Auto if tor_available => Some(LAN_AUTO_TIMEOUT),
             _ => None,
         };
-        match try_lan(lan_role, my_fp, target_fp, lan, timeout).await {
-            Ok(tcp) => return Ok((Conn::Tcp(tcp), lan_role)),
+        match try_lan(role, my_fp, target_fp, lan, timeout).await {
+            Ok(tcp) => return Ok((Conn::Tcp(tcp), role)),
             Err(e) => {
                 // Hanya fallback bila Tor tersedia; jika tidak, kembalikan error LAN.
                 if !tor_available {
@@ -155,106 +150,52 @@ pub async fn establish(
         }
     }
 
-    // 2) Fallback Tor — gunakan Symmetric Connect.
+    // 2) Fallback Tor — role deterministik, Initiator retry dial, Responder accept dengan timeout.
     let tor = tor.ok_or_else(|| Error::Tor("Tor tidak aktif".into()))?;
-    let onion = onion.ok_or_else(|| Error::Tor("kontak tidak punya onion address".into()))?;
-    establish_tor_symmetric(my_fp, target_fp, onion, tor).await
-}
-
-/// Symmetric Connect via Tor: kedua sisi race dial-peer vs accept-incoming.
-///
-/// Siapapun yang menang (dial atau accept), role di-negosiasikan via 1 byte
-/// sebelum Noise handshake. Ini menghilangkan ketergantungan pada onion descriptor
-/// peer sudah terpublikasikan: jika peer-lah yang berhasil dial kita duluan,
-/// kita tetap terhubung tanpa perlu menunggu onion kita sendiri.
-async fn establish_tor_symmetric(
-    my_fp: &str,
-    target_fp: &str,
-    onion: &str,
-    tor: &Arc<TorContext>,
-) -> Result<(Conn, Role), Error> {
-    // Kloning Arc supaya bisa di-move ke dua branch sekaligus.
-    let tor_dial = Arc::clone(tor);
-    let tor_accept = Arc::clone(tor);
-    let onion_owned = onion.to_string();
-
-    tokio::select! {
-        // Branch A: kita dial .onion peer → prefer Initiator
-        dial_result = async move { tor_dial.connect(&onion_owned, tor::TOR_VIRTUAL_PORT).await } => {
-            let ds = dial_result?;
-            negotiate_role(ds, ROLE_HINT_INITIATOR, my_fp, target_fp).await
+    match role {
+        Role::Initiator => {
+            let host = onion.ok_or_else(|| Error::Tor("kontak tidak punya onion address".into()))?;
+            tor_dial_with_retry(tor, host).await.map(|ds| (Conn::Tor(ds), role))
         }
-        // Branch B: peer dial kita → prefer Responder
-        accept_result = tor_accept.accept_timeout(TOR_ACCEPT_TIMEOUT) => {
-            let ds = accept_result.ok_or(Error::ConnectionClosed)?;
-            negotiate_role(ds, ROLE_HINT_RESPONDER, my_fp, target_fp).await
+        Role::Responder => {
+            let ds = tor
+                .accept_timeout(TOR_ACCEPT_TIMEOUT)
+                .await
+                .ok_or(Error::ConnectionClosed)?;
+            Ok((Conn::Tor(ds), role))
         }
     }
 }
 
-/// Negosiasikan role Initiator/Responder via 1-byte mini-protocol sebelum Noise.
+/// Dial .onion peer dengan retry dan exponential backoff.
 ///
-/// Kedua sisi mengirim byte hint mereka **dan** membaca byte hint peer secara
-/// simultan (tanpa tunggu dulu). Jika ada konflik (dua Initiator atau dua
-/// Responder), fingerprint lebih kecil menang menjadi Initiator.
-///
-/// Mengembalikan `(DataStream, Role)` — stream yang sama dikembalikan untuk
-/// dipakai oleh session layer di atasnya.
-async fn negotiate_role(
-    ds: arti_client::DataStream,
-    my_hint: u8,
-    my_fp: &str,
-    target_fp: &str,
-) -> Result<(Conn, Role), Error> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
+/// Onion descriptor peer mungkin belum terpublikasikan ke Tor network (~1–3
+/// menit setelah bootstrap). Retry memastikan kita tidak menyerah saat
+/// descriptor belum siap — coba lagi setiap `TOR_DIAL_RETRY_DELAY` detik
+/// sampai total timeout `TOR_DIAL_TOTAL_TIMEOUT`.
+async fn tor_dial_with_retry(
+    tor: &Arc<TorContext>,
+    host: &str,
+) -> Result<DataStream, Error> {
+    let deadline = tokio::time::Instant::now() + TOR_DIAL_TOTAL_TIMEOUT;
+    let mut last_err = Error::ConnectionClosed;
 
-    // Wrap DataStream ke tokio-compat agar bisa pakai tokio AsyncRead/AsyncWrite.
-    // Kita butuh baca + tulis 1 byte secara simultan → split dulu.
-    let (rd_compat, wr_compat) = ds.split();
-    let mut rd = rd_compat.compat();
-    let mut wr = wr_compat.compat_write();
-
-    // Kirim hint kita + baca hint peer secara simultan.
-    let hint_buf = [my_hint];
-    let send_fut = wr.write_all(&hint_buf);
-    let recv_fut = async {
-        let mut buf = [0u8; 1];
-        rd.read_exact(&mut buf).await?;
-        Ok::<u8, std::io::Error>(buf[0])
-    };
-
-    let (send_res, recv_res) = tokio::join!(send_fut, recv_fut);
-    send_res?;
-    let peer_hint = recv_res?;
-
-    // Flush setelah write.
-    wr.flush().await?;
-
-    // Tentukan role berdasarkan hint yang diterima.
-    let role = match (my_hint, peer_hint) {
-        (ROLE_HINT_INITIATOR, ROLE_HINT_RESPONDER) => Role::Initiator,
-        (ROLE_HINT_RESPONDER, ROLE_HINT_INITIATOR) => Role::Responder,
-        // Konflik: keduanya prefer Initiator atau keduanya prefer Responder.
-        // Tiebreak: fingerprint lebih kecil jadi Initiator.
-        _ => role_from_fp(my_fp, target_fp),
-    };
-
-    // DataStream dari arti-client tidak bisa di-unsplit setelah split().
-    // Solusi: buat channel bridge via tokio::io::duplex — client_side dipakai
-    // oleh session layer di atas, server_side dihubungkan ke DataStream halves
-    // lewat dua copy task yang berjalan di background.
-    let (client_side, server_side) = tokio::io::duplex(65536);
-    tokio::spawn(async move {
-        let (mut ds_rd, mut ds_wr) = tokio::io::split(server_side);
-        tokio::select! {
-            _ = tokio::io::copy(&mut rd, &mut ds_wr) => {}
-            _ = tokio::io::copy(&mut ds_rd, &mut wr) => {}
+    loop {
+        match tor.connect(host, tor::TOR_VIRTUAL_PORT).await {
+            Ok(ds) => return Ok(ds),
+            Err(e) => {
+                last_err = e;
+                if tokio::time::Instant::now() + TOR_DIAL_RETRY_DELAY > deadline {
+                    break; // tidak cukup waktu untuk retry lagi
+                }
+                tokio::time::sleep(TOR_DIAL_RETRY_DELAY).await;
+            }
         }
-    });
+    }
 
-    Ok((Conn::Duplex(client_side), role))
+    Err(last_err)
 }
+
 
 
 async fn try_lan(
