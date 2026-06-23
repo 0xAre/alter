@@ -308,12 +308,12 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         )
     };
     let transport_pill: Span = if app.tor_active() {
-        pill(" ⬡ TOR ".to_string(), ACCENT)
+        pill(" ◉ ONLINE ".to_string(), ACCENT)
     } else if app.tor_connecting {
         let spinner = SPINNER[(app.tick_count % SPINNER_LEN) as usize];
-        pill(format!(" ⬡ TOR {spinner} "), WARNING)
+        pill(format!(" {spinner} LINKING "), WARNING)
     } else {
-        pill(" LAN ".to_string(), Color::Gray)
+        pill(" ⌂ LOCAL ".to_string(), Color::Gray)
     };
 
     // Status sesi / notifikasi — pakai dot berwarna semantik.
