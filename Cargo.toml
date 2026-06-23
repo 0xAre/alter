@@ -1,0 +1,94 @@
+[package]
+name = "alter"
+version = "0.1.4"
+edition = "2021"
+# Dinaikkan dari 1.75 ke 1.89 di M2: arti-client 0.43.x (sesuai PRD) butuh rustc >= 1.89.
+rust-version = "1.89"
+
+[[bin]]
+name = "alter"
+path = "src/main.rs"
+
+[dependencies]
+# Identity signing (Ed25519)
+ed25519-dalek = { version = "2.2", features = ["rand_core", "zeroize"] }
+
+# Noise handshake DH (X25519 — kept separate from Ed25519 identity)
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+
+# Noise Protocol Framework (Noise_IK pattern)
+snow = "0.10"
+
+# Key derivation from passphrase (Argon2id)
+argon2 = "0.5"
+
+# AEAD for vault encryption (ChaCha20Poly1305)
+chacha20poly1305 = "0.10"
+
+# Secure memory zeroing (all secrets implement ZeroizeOnDrop)
+zeroize = { version = "1", features = ["derive"] }
+
+# CSPRNG
+rand = "0.8"
+
+# Error handling
+thiserror = "2"
+
+# Hex encoding untuk fingerprint identitas (dipakai juga di runtime, bukan cuma test)
+hex = "0.4"
+
+# Async runtime (networking + TUI event loop)
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "sync", "time", "io-util", "macros", "rt"] }
+
+# Terminal UI
+ratatui = "0.29.0"
+crossterm = "0.29.0"
+
+# LAN service discovery
+mdns-sd = "0.20.0"
+
+# Enumerasi interface jaringan: untuk menyiarkan hanya IP LAN asli (buang
+# link-local 169.254.x / adapter virtual) saat advertise mDNS. Versi disamakan
+# dengan yang sudah ditarik transitif oleh mdns-sd (tanpa dependensi baru).
+if-addrs = "0.15"
+
+# Invite code encoding
+base64 = "0.22.1"
+
+# KDF untuk enkripsi file kontak (key diturunkan dari identity)
+blake2 = "0.10"
+
+# Clipboard lintas platform (salin invite dengan tombol 'c')
+arboard = "3"
+# Tor (M2). default-features=false untuk drop native-tls/openssl (pakai rustls saja,
+# penting agar build di Windows tidak butuh OpenSSL/perl).
+arti-client = { version = "0.43.0", default-features = false, features = ["tokio", "rustls", "onion-service-service", "onion-service-client", "compression"] }
+tor-rtcompat = { version = "0.43.0", default-features = false, features = ["tokio", "rustls"] }
+
+# Compat futures<->tokio untuk membungkus arti DataStream sebagai tokio stream
+tokio-util = { version = "0.7.18", features = ["compat"] }
+futures = "0.3.32"
+
+# Tipe Tor yang tidak di-reexport arti-client
+tor-hsservice = "0.43.0"   # OnionServiceConfigBuilder, handle_rend_requests, RunningOnionService
+tor-cell = "0.43.0"        # Connected (untuk StreamRequest::accept)
+safelog = "0.8"            # DisplayRedacted untuk ambil string .onion dari HsId
+
+# rusqlite ditarik transitif oleh arti (state storage). Paksa fitur `bundled`
+# agar sqlite dikompilasi dari source — di Windows tidak ada sqlite3.lib sistem.
+rusqlite = { version = "0.39", features = ["bundled"] }
+
+# rustls butuh CryptoProvider terpasang eksplisit (kita pakai ring) sebelum
+# bootstrap Tor — lihat install_default() di main.rs.
+rustls = { version = "0.23", features = ["ring"] }
+
+[dev-dependencies]
+hex = "0.4"
+
+[profile.release]
+# Strip debug info for smaller binary; symbols not needed in production
+strip = true
+# Optimize for binary size without sacrificing speed
+opt-level = "z"
+lto = true
+codegen-units = 1

@@ -1,0 +1,21 @@
+# Build artifacts
+/target
+
+# Identitas & rahasia — JANGAN pernah commit
+*.key
+id.key
+
+# State & cache Tor (key onion persisten, jangan commit)
+*-tcache/
+*-tstate/
+.alter/
+
+# Artefak rilis lokal
+/dist
+
+# Scratch / log
+*.log
+
+# OS
+Thumbs.db
+.DS_Store
