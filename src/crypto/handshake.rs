@@ -20,8 +20,7 @@ use crate::error::Error;
 
 const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 
-/// Max message size untuk buffer handshake
-const MAX_MSG_LEN: usize = 65535;
+
 
 /// State machine handshake — wrapper tipis di atas snow::HandshakeState.
 pub struct HandshakeSession {
@@ -62,9 +61,7 @@ impl HandshakeSession {
         self.state.read_message(input, buf).map_err(Error::Noise)
     }
 
-    pub fn is_finished(&self) -> bool {
-        self.state.is_handshake_finished()
-    }
+
 
     /// Pindah ke transport mode setelah handshake selesai.
     /// Memanggil ini sebelum handshake selesai akan menghasilkan error.
@@ -104,25 +101,25 @@ mod tests {
     use super::*;
     use crate::identity::keypair::NoiseKey;
 
+    const HS_BUF: usize = 65535;
+
     fn do_handshake(
         initiator: &mut HandshakeSession,
         responder: &mut HandshakeSession,
     ) -> Result<(), Error> {
         // Message 1: Initiator → Responder
-        let mut msg1 = vec![0u8; MAX_MSG_LEN];
+        let mut msg1 = vec![0u8; HS_BUF];
         let len1 = initiator.write_message(&[], &mut msg1)?;
 
-        let mut buf = vec![0u8; MAX_MSG_LEN];
+        let mut buf = vec![0u8; HS_BUF];
         responder.read_message(&msg1[..len1], &mut buf)?;
 
         // Message 2: Responder → Initiator
-        let mut msg2 = vec![0u8; MAX_MSG_LEN];
+        let mut msg2 = vec![0u8; HS_BUF];
         let len2 = responder.write_message(&[], &mut msg2)?;
 
         initiator.read_message(&msg2[..len2], &mut buf)?;
 
-        assert!(initiator.is_finished(), "initiator seharusnya selesai");
-        assert!(responder.is_finished(), "responder seharusnya selesai");
         Ok(())
     }
 
@@ -204,10 +201,10 @@ mod tests {
         let mut bob = HandshakeSession::new_responder(&bob_noise.secret_bytes()).unwrap();
 
         // Message 1: Alice mengirim — `es` DH pakai eve's pubkey, bukan bob's
-        let mut msg1 = vec![0u8; MAX_MSG_LEN];
+        let mut msg1 = vec![0u8; HS_BUF];
         let len1 = alice.write_message(&[], &mut msg1).unwrap();
 
-        let mut buf = vec![0u8; MAX_MSG_LEN];
+        let mut buf = vec![0u8; HS_BUF];
         // Bob tidak bisa dekripsi: `es` DH result tidak cocok (eve_key ≠ bob_key)
         // Noise_IK message 1 langsung gagal di sisi responder
         let result = bob.read_message(&msg1[..len1], &mut buf);

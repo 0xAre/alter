@@ -41,7 +41,4 @@ pub enum Error {
     #[error("peer identity mismatch")]
     IdentityMismatch,
 
-    /// Kedua sisi gagal menyepakati role (Initiator/Responder) saat negosiasi.
-    #[error("role negotiation failed")]
-    RoleNegotiationFailed,
 }

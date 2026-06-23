@@ -213,10 +213,6 @@ async fn real_main(args: Args) -> Result<(), Error> {
     if online {
         // rustls perlu CryptoProvider default terpasang sebelum dipakai arti.
         let _ = rustls::crypto::ring::default_provider().install_default();
-        // Dev convenience di Windows: lewati cek permission fs-mistrust.
-        if std::env::var("FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS").is_err() {
-            std::env::set_var("FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS", "true");
-        }
     }
 
     // Subcommand `id`: butuh onion sinkron (bootstrap dulu bila online).
@@ -313,6 +309,12 @@ async fn real_main(args: Args) -> Result<(), Error> {
 }
 
 fn main() {
+    // Dev convenience di Windows: lewati cek permission fs-mistrust.
+    // WAJIB sebelum tokio runtime di-build — set_var unsafe di multi-thread (Rust ≥ 1.83).
+    if std::env::var("FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS").is_err() {
+        std::env::set_var("FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS", "true");
+    }
+
     let args = match Args::parse() {
         Ok(a) => a,
         Err(msg) => {

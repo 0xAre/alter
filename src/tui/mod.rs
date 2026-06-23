@@ -5,6 +5,8 @@
 
 mod ui;
 
+use zeroize::Zeroize;
+
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -29,11 +31,18 @@ use crate::transport::tor::TorContext;
 use crate::transport::{self, LanMode};
 
 /// Material identitas milik sendiri (tersedia setelah unlock).
+///
+/// `noise_sk` adalah secret key — wajib ZeroizeOnDrop (SEC-04).
+#[derive(zeroize::ZeroizeOnDrop)]
 pub struct SelfKeys {
+    #[zeroize(skip)]
     pub fingerprint: String,
     pub noise_sk: [u8; 32],
+    #[zeroize(skip)]
     pub noise_pub: [u8; 32],
+    #[zeroize(skip)]
     pub ed25519_pub: [u8; 32],
+    #[zeroize(skip)]
     pub invite: String,
 }
 
@@ -439,12 +448,12 @@ fn handle_unlock_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Esc => return true,
         KeyCode::Enter => {
             if try_unlock(app) {
-                app.pass_input.clear();
+                app.pass_input.zeroize();
                 app.init_step = 1;
                 app.init_start_tick = app.tick_count;
                 app.screen = Screen::Init;
             } else {
-                app.pass_input.clear();
+                app.pass_input.zeroize();
             }
         }
         KeyCode::Backspace => { app.pass_input.pop(); }
@@ -481,14 +490,14 @@ fn handle_create_key(app: &mut App, key: KeyEvent) -> bool {
                 }
             } else if app.pass_confirm != app.pass_input {
                 app.auth_error = Some("Passphrase tidak cocok. Ulangi.".into());
-                app.pass_input.clear();
-                app.pass_confirm.clear();
+                app.pass_input.zeroize();
+                app.pass_confirm.zeroize();
                 app.create_confirming = false;
             } else {
                 match create_vault(app) {
                     Ok(()) => {
-                        app.pass_input.clear();
-                        app.pass_confirm.clear();
+                        app.pass_input.zeroize();
+                        app.pass_confirm.zeroize();
                         app.auth_error = None;
                         app.init_step = 1;
                         app.init_start_tick = app.tick_count;
@@ -723,6 +732,14 @@ fn add_contact_from_buffer(app: &mut App) {
 
     match contacts::decode_invite(code) {
         Ok((ed, noise, onion)) => {
+            // Cegah user menambah diri sendiri — fingerprint identik menyebabkan
+            // role_from_fp deadlock (kedua sisi jadi Responder).
+            if let Some(keys) = &app.keys {
+                if ed == keys.ed25519_pub {
+                    app.set_notif_error("[!] Tidak bisa menambah diri sendiri sebagai kontak.");
+                    return;
+                }
+            }
             let nickname = if nick.is_empty() {
                 format!("peer-{}", &contacts::fingerprint(&ed)[..8])
             } else {

@@ -83,7 +83,6 @@ dependencies = [
  "snow",
  "thiserror 2.0.18",
  "tokio",
- "tokio-util",
  "tor-cell",
  "tor-hsservice",
  "tor-rtcompat",

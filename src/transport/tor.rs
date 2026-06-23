@@ -111,13 +111,7 @@ impl TorContext {
             .map_err(|e| Error::Tor(e.to_string()))
     }
 
-    /// Tunggu stream masuk berikutnya dari onion service kita (sebagai responder).
-    pub async fn accept(&self) -> Option<DataStream> {
-        let mut rx = self.incoming.lock().await;
-        rx.recv().await
-    }
-
-    /// Seperti `accept`, tapi berhenti setelah `timeout` jika tidak ada koneksi masuk.
+    /// Tunggu stream masuk berikutnya dengan timeout.
     /// Mengembalikan `None` bila waktu habis atau channel tertutup.
     pub async fn accept_timeout(&self, timeout: Duration) -> Option<DataStream> {
         let mut rx = self.incoming.lock().await;

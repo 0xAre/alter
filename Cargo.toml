@@ -65,8 +65,7 @@ arboard = "3"
 arti-client = { version = "0.43.0", default-features = false, features = ["tokio", "rustls", "onion-service-service", "onion-service-client", "compression"] }
 tor-rtcompat = { version = "0.43.0", default-features = false, features = ["tokio", "rustls"] }
 
-# Compat futures<->tokio untuk membungkus arti DataStream sebagai tokio stream
-tokio-util = { version = "0.7.18", features = ["compat"] }
+# Compat futures<->tokio untuk StreamExt di tor.rs
 futures = "0.3.32"
 
 # Tipe Tor yang tidak di-reexport arti-client
