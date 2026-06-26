@@ -27,6 +27,7 @@ use crate::error::Error;
 use crate::identity::keypair::KeyBundle;
 use crate::identity::vault;
 use crate::session::{self, SessionEvent, SessionState};
+use crate::transport::obfs4::Obfs4Status;
 use crate::transport::tor::TorContext;
 use crate::transport::{self, LanMode};
 
@@ -71,6 +72,9 @@ pub(crate) enum Screen {
     Unlock,
     Create,
     Init,
+    /// Onboarding singkat — ditampilkan sekali setelah vault baru dibuat (R-07).
+    /// Menjelaskan model Room-Bound Sync agar user tidak kaget saat pesan "hilang".
+    Onboard,
     Main,
 }
 
@@ -188,6 +192,18 @@ pub(crate) struct App {
     pub conn_task: Option<tokio::task::JoinHandle<()>>,
     pub contacts_key: Option<[u8; 32]>,
     pub pending_delete: Option<usize>,
+
+    // R-07: true jika onboarding harus tampil setelah init selesai (hanya vault baru).
+    pub show_onboard_after_init: bool,
+
+    // SEC-06: ketersediaan obfs4proxy (deteksi saat startup).
+    pub obfs4_status: Obfs4Status,
+
+    // SEC-11: panic wipe state.
+    // `panic_armed_tick` = tick saat tekan pertama Ctrl+Shift+X; None = tidak aktif.
+    // `should_panic_wipe` = true setelah tekan kedua dikonfirmasi; diproses loop utama.
+    pub panic_armed_tick: Option<u64>,
+    pub should_panic_wipe: bool,
 }
 
 impl App {
@@ -226,6 +242,10 @@ impl App {
             conn_task: None,
             contacts_key: None,
             pending_delete: None,
+            show_onboard_after_init: false,
+            obfs4_status: crate::transport::obfs4::detect(),
+            panic_armed_tick: None,
+            should_panic_wipe: false,
         }
     }
 
@@ -364,7 +384,12 @@ pub async fn run(
                         _      => 4,
                     };
                     if elapsed >= 14 {
-                        app.screen = Screen::Main;
+                        // R-07: tunjukkan onboarding setelah init hanya untuk vault baru.
+                        if app.show_onboard_after_init {
+                            app.screen = Screen::Onboard;
+                        } else {
+                            app.screen = Screen::Main;
+                        }
                     }
                 }
 
@@ -376,9 +401,36 @@ pub async fn run(
                         }
                     }
                 }
+
+                // SEC-11: reset panic arm setelah 3 detik (30 tick × 100ms)
+                if let Some(armed_tick) = app.panic_armed_tick {
+                    if app.tick_count.saturating_sub(armed_tick) > 30 {
+                        app.panic_armed_tick = None;
+                        // Hapus notifikasi panic jika masih tampil
+                        if matches!(&app.notification, Some(n) if n.text.contains("PANIC")) {
+                            app.notification = None;
+                        }
+                    }
+                }
             }
         }
     };
+
+    // SEC-11: panic wipe — zeroize semua data sensitif sebelum cleanup terminal.
+    // `app.keys = None` memicu ZeroizeOnDrop pada SelfKeys.noise_sk (SEC-04).
+    // `app.tor = None` men-drop Arc<TorContext> → onion service mati segera.
+    if app.should_panic_wipe {
+        if let Some(h) = app.conn_task.take() {
+            h.abort();
+        }
+        app.tor = None;
+        app.keys = None;
+        app.pass_input.zeroize();
+        app.pass_confirm.zeroize();
+        app.messages.clear();
+        app.input.clear();
+        app.add_buffer.clear();
+    }
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -419,6 +471,28 @@ fn spawn_input_thread(tx: mpsc::UnboundedSender<KeyEvent>) {
     });
 }
 
+/// SEC-11: proses tekan Ctrl+Shift+X (deteksi via uppercase 'X' + Ctrl).
+///
+/// Tekan pertama: arm (tampilkan peringatan, mulai countdown 3 detik).
+/// Tekan kedua dalam 30 tick (3 detik): konfirmasi panic wipe → return true (exit).
+fn handle_panic_hotkey(app: &mut App) -> bool {
+    if let Some(armed_tick) = app.panic_armed_tick {
+        if app.tick_count.saturating_sub(armed_tick) <= 30 {
+            // Tekan kedua dalam window — konfirmasi wipe
+            app.should_panic_wipe = true;
+            return true;
+        }
+    }
+    // Tekan pertama (atau sudah expired): arm
+    app.panic_armed_tick = Some(app.tick_count);
+    app.notification = Some(Notification {
+        level: NotifLevel::Error,
+        text: "⚠ PANIC — tekan Ctrl+Shift+X lagi dalam 3 detik untuk wipe & exit.".into(),
+        dismiss_at: None, // jangan auto-dismiss; direset oleh tick handler
+    });
+    false
+}
+
 fn handle_key(
     app: &mut App,
     out_tx: &mut Option<mpsc::UnboundedSender<String>>,
@@ -427,6 +501,11 @@ fn handle_key(
 ) -> bool {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return true;
+    }
+
+    // SEC-11: Ctrl+Shift+X — 'X' uppercase mengindikasikan Shift ditekan.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('X') {
+        return handle_panic_hotkey(app);
     }
 
     match app.screen {
@@ -439,6 +518,11 @@ fn handle_key(
         Screen::Unlock => handle_unlock_key(app, key),
         Screen::Create => handle_create_key(app, key),
         Screen::Init => handle_init_key(app, key),
+        Screen::Onboard => {
+            // Tombol apapun dismiss onboarding → masuk Main
+            app.screen = Screen::Main;
+            false
+        }
         Screen::Main => handle_main_key(app, out_tx, ev_rx, key),
     }
 }
@@ -501,7 +585,10 @@ fn handle_create_key(app: &mut App, key: KeyEvent) -> bool {
                         app.auth_error = None;
                         app.init_step = 1;
                         app.init_start_tick = app.tick_count;
+                        // R-07: tunjukkan onboarding hanya pada vault baru — user
+                        // yang existing sudah familiar dengan model ephemeral.
                         app.screen = Screen::Init;
+                        app.show_onboard_after_init = true;
                     }
                     Err(_) => {
                         app.auth_error = Some("Gagal membuat vault.".into());

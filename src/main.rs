@@ -2,6 +2,7 @@ mod contacts;
 mod crypto;
 mod error;
 mod identity;
+mod platform;
 mod session;
 mod transport;
 mod tui;
@@ -12,6 +13,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
+
+use zeroize::Zeroizing;
 
 use crate::contacts::Contact;
 use crate::error::Error;
@@ -30,6 +33,8 @@ struct Args {
     add_name: Option<String>,
     /// Online (Tor) default aktif; `--offline` mematikannya (LAN murni).
     offline: bool,
+    /// SEC-09: nama proses generik — visible di `ps aux` / Task Manager.
+    process_name: Option<String>,
 }
 
 /// Home directory cross-platform (USERPROFILE di Windows, HOME di Unix).
@@ -59,6 +64,7 @@ impl Args {
         let mut add_invite = None;
         let mut add_name = None;
         let mut offline = false;
+        let mut process_name: Option<String> = None;
 
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -84,6 +90,9 @@ impl Args {
                     add_name = Some(it.next().ok_or("--name butuh nickname")?);
                 }
                 "--offline" => offline = true,
+                "--process-name" => {
+                    process_name = Some(it.next().ok_or("--process-name butuh argumen nama")?.to_string());
+                }
                 "--tor" => {} // diterima tapi no-op: online sudah default
                 "-h" | "--help" => return Err(help_text()),
                 other => return Err(format!("argumen tidak dikenal: {other}\n\n{}", help_text())),
@@ -104,6 +113,7 @@ impl Args {
             add_invite,
             add_name,
             offline,
+            process_name,
         })
     }
 }
@@ -123,6 +133,7 @@ Opsi:
   --listen <port>         Paksa mode responder (listen) — untuk testing 1 mesin
   --dial <ip:port>        Paksa mode initiator (dial langsung) — untuk testing
   --offline               Matikan Tor (LAN murni; tak butuh internet)
+  --process-name <name>   Set nama proses di ps/Task Manager (SEC-09)
   -h, --help              Tampilkan bantuan ini
 
 Default: ONLINE (LAN + Tor). Tor bootstrap di latar belakang — TUI langsung jalan,
@@ -150,17 +161,45 @@ fn tor_dirs(vault_path: &std::path::Path) -> (String, String) {
     )
 }
 
-/// Baca passphrase: dari env (otomasi) atau stdin (interaktif).
-/// Catatan M1: input stdin ter-echo. Hidden input (crossterm) menyusul di M4.
-fn read_passphrase(prompt: &str) -> Result<String, Error> {
+/// Baca passphrase tanpa echo: dari env (otomasi) atau crossterm raw mode (interaktif).
+/// M4: menggantikan stdin read_line yang ter-echo. Return Zeroizing<String> agar
+/// passphrase otomatis di-wipe dari memori saat tidak lagi dibutuhkan.
+fn read_passphrase(prompt: &str) -> Result<Zeroizing<String>, Error> {
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+
     if let Ok(p) = std::env::var("ALTER_PASSPHRASE") {
-        return Ok(p);
+        return Ok(Zeroizing::new(p));
     }
+
     print!("{prompt}");
     io::stdout().flush().ok();
-    let mut s = String::new();
-    io::stdin().read_line(&mut s)?;
-    Ok(s.trim_end_matches(['\r', '\n']).to_string())
+
+    enable_raw_mode()?;
+    let mut pass = Zeroizing::new(String::new());
+    loop {
+        match event::read() {
+            Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => match k.code {
+                KeyCode::Enter => break,
+                KeyCode::Char(c) => pass.push(c),
+                KeyCode::Backspace => { pass.pop(); }
+                KeyCode::Esc => {
+                    disable_raw_mode().ok();
+                    println!();
+                    return Err(Error::KeyDerivation); // dibatalkan user
+                }
+                _ => {}
+            },
+            Err(e) => {
+                disable_raw_mode().ok();
+                return Err(Error::Io(e));
+            }
+            _ => {}
+        }
+    }
+    disable_raw_mode().ok();
+    println!(); // newline setelah input tersembunyi
+    Ok(pass)
 }
 
 /// Muat vault dari disk, atau buat identitas baru bila belum ada.
@@ -322,6 +361,11 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    // SEC-09: set nama proses sebelum runtime dibuat (single-thread, aman).
+    if let Some(ref name) = args.process_name {
+        platform::set_process_name(name);
+    }
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

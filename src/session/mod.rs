@@ -119,8 +119,9 @@ where
             maybe_text = outgoing.recv() => {
                 match maybe_text {
                     Some(text) => {
-                        let mut ct = vec![0u8; text.len() + 16];
-                        let n = session.encrypt(text.as_bytes(), &mut ct)?;
+                        let padded = crate::crypto::padding::pad(text.as_bytes());
+                        let mut ct = vec![0u8; padded.len() + 16];
+                        let n = session.encrypt(&padded, &mut ct)?;
                         if write_frame(&mut wr, &ct[..n]).await.is_err() {
                             break;
                         }
@@ -140,10 +141,15 @@ where
                 let mut pt = vec![0u8; n];
                 match session.decrypt(&buf[..n], &mut pt) {
                     Ok(m) => {
-                        let text = String::from_utf8_lossy(&pt[..m]).to_string();
-                        let _ = events.send(SessionEvent::Message(text));
+                        match crate::crypto::padding::unpad(&pt[..m]) {
+                            Ok(data) => {
+                                let text = String::from_utf8_lossy(data).to_string();
+                                let _ = events.send(SessionEvent::Message(text));
+                            }
+                            Err(()) => break, // padding invalid → fail closed
+                        }
                     }
-                    Err(_) => break, // dekripsi gagal → putus (fail closed)
+                    Err(_) => break, // dekripsi gagal → fail closed
                 }
             }
         }

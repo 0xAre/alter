@@ -1,6 +1,6 @@
 [package]
 name = "alter"
-version = "0.1.8"
+version = "0.2.0"
 edition = "2021"
 # Dinaikkan dari 1.75 ke 1.89 di M2: arti-client 0.43.x (sesuai PRD) butuh rustc >= 1.89.
 rust-version = "1.89"
@@ -60,6 +60,7 @@ blake2 = "0.10"
 
 # Clipboard lintas platform (salin invite dengan tombol 'c')
 arboard = "3"
+
 # Tor (M2). default-features=false untuk drop native-tls/openssl (pakai rustls saja,
 # penting agar build di Windows tidak butuh OpenSSL/perl).
 arti-client = { version = "0.43.0", default-features = false, features = ["tokio", "rustls", "onion-service-service", "onion-service-client", "compression"] }
@@ -83,6 +84,11 @@ rustls = { version = "0.23", features = ["ring"] }
 
 [dev-dependencies]
 hex = "0.4"
+
+# SEC-09: prctl (Linux) / pthread_setname_np (macOS) untuk set nama proses.
+# Windows memakai SetConsoleTitleW via FFI langsung — tidak butuh libc.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = "0.2"
 
 [profile.release]
 # Strip debug info for smaller binary; symbols not needed in production

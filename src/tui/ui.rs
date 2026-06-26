@@ -8,6 +8,7 @@ use ratatui::Frame;
 
 use super::{App, Mode, NotifLevel, RoomState, Screen, Who};
 
+
 // ─── ASCII logo ───────────────────────────────────────────────────────────────
 const LOGO: &[&str] = &[
     "   █████╗ ██╗  ████████╗███████╗██████╗ ",
@@ -50,6 +51,7 @@ pub(super) fn render(f: &mut Frame, app: &App) {
         Screen::Splash => render_splash(f, app),
         Screen::Unlock | Screen::Create => render_auth(f, app),
         Screen::Init => render_init(f, app),
+        Screen::Onboard => render_onboard(f, app),
         Screen::Main => render_main(f, app),
     }
 }
@@ -221,6 +223,70 @@ fn render_init(f: &mut Frame, app: &App) {
     );
 }
 
+// ─────────────────────────────── Onboarding (R-07) ───────────────────────────
+
+fn render_onboard(f: &mut Frame, _app: &App) {
+    let area = f.area();
+    f.render_widget(Clear, area);
+
+    let card = centered_rect_abs(58, 20, area);
+
+    let mut lines = render_logo_lines();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Selamat datang di ALTER",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Baca sebelum mulai — ALTER berbeda:",
+        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  ●  ", Style::default().fg(ACCENT)),
+        Span::styled("Kedua pihak harus online bersamaan.", Style::default().fg(TEXT)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("       ", Style::default()),
+        Span::styled("Tidak ada notifikasi, tidak ada pesan offline.", Style::default().fg(DIM)),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  ●  ", Style::default().fg(ACCENT)),
+        Span::styled("Pesan tidak tersimpan di mana pun.", Style::default().fg(TEXT)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("       ", Style::default()),
+        Span::styled("Begitu sesi ditutup, pesan tidak bisa dibaca kembali.", Style::default().fg(DIM)),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  ●  ", Style::default().fg(ACCENT)),
+        Span::styled("Reconnect = sesi baru.", Style::default().fg(TEXT)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("       ", Style::default()),
+        Span::styled("Koneksi terputus tidak bisa dilanjutkan.", Style::default().fg(DIM)),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Ini bukan keterbatasan — ini adalah identitas ALTER.",
+        Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
+    )));
+
+    f.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Left),
+        card,
+    );
+
+    render_footer(
+        f,
+        area,
+        Line::from(vec![d(" "), k("[Tombol apa pun]"), d(" lanjut ke aplikasi")]),
+    );
+}
+
 // ─────────────────────────────── Main screen ──────────────────────────────────
 
 fn render_main(f: &mut Frame, app: &App) {
@@ -351,9 +417,21 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Min(10), Constraint::Length(16)])
         .split(vrows[1]);
 
+    // SEC-06: obfs4 badge — tampil hanya jika obfs4proxy ditemukan di PATH.
+    let obfs4_label = app.obfs4_status.badge_label();
+    let obfs4_span = if !obfs4_label.is_empty() {
+        Span::styled(
+            obfs4_label,
+            Style::default().fg(Color::Black).bg(DIM).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw("")
+    };
+
     let left = Line::from(vec![
         Span::raw(" "),
         transport_pill,
+        obfs4_span,
         Span::raw("   "),
         status_span,
     ]);

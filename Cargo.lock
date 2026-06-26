@@ -74,6 +74,7 @@ dependencies = [
  "futures",
  "hex",
  "if-addrs",
+ "libc",
  "mdns-sd",
  "rand 0.8.6",
  "ratatui",

@@ -5,6 +5,7 @@
 
 pub mod frame;
 pub mod lan;
+pub mod obfs4;
 pub mod tor;
 
 use std::net::SocketAddr;

@@ -20,7 +20,9 @@ use crate::error::Error;
 
 const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 
-
+// SEC-08: payload di setiap write_message selalu &[] (kosong). Noise pattern
+// string di atas hanya dipakai untuk inisialisasi snow — TIDAK dikirim lewat
+// jaringan. snow tidak embed version/identifier di transport messages.
 
 /// State machine handshake — wrapper tipis di atas snow::HandshakeState.
 pub struct HandshakeSession {
