@@ -1,0 +1,9 @@
+[advisories]
+
+# RUSTSEC-2023-0071: Marvin Attack — RSA timing sidechannel
+# Dep chain: arti-client → ssh-key-fork-arti → rsa
+# Assessment: ALTER sendiri TIDAK menggunakan RSA. rsa dipakai arti-client
+# untuk Tor relay/onion authentication internal (bukan crypto E2E ALTER). Attack
+# vector butuh timing oracle terhadap operasi kunci relay Tor — di luar model
+# ancaman ALTER. Tidak ada fix upstream tersedia; ditunggu sampai arti update.
+ignore = ["RUSTSEC-2023-0071"]
