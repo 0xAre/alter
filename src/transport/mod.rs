@@ -2,6 +2,7 @@
 //!
 //! M1: LAN (mDNS + direct TCP).
 //! M2: Tor onion service via arti-client, dengan fallback LAN-first → Tor.
+//! M5 (SEC-13): sebelum dial, inject our client auth key ke keystore arti.
 
 pub mod frame;
 pub mod lan;
@@ -22,34 +23,23 @@ use tokio::sync::mpsc;
 use crate::error::Error;
 use tor::TorContext;
 
-/// Timeout percobaan LAN sebelum fallback ke Tor (PRD: ~3 detik).
 const LAN_AUTO_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Peran dalam handshake Noise_IK. Deterministik dari perbandingan fingerprint
-/// supaya kedua sisi tidak sama-sama mendial.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     Initiator,
     Responder,
 }
 
-/// Mode jalur LAN.
 #[derive(Clone, Copy, Debug)]
 pub enum LanMode {
-    /// Otomatis: role dari fingerprint, discovery via mDNS.
     Auto,
-    /// Paksa responder, listen di port tertentu (testing satu mesin).
     Listen(u16),
-    /// Paksa initiator, dial langsung (testing).
     Dial(SocketAddr),
-    /// Lewati LAN sepenuhnya (Tor saja). Disediakan untuk kontak onion-only;
-    /// belum di-wire ke UI (default app pakai Auto = LAN-first → Tor).
     #[allow(dead_code)]
     Off,
 }
 
-/// Koneksi transport: TCP (LAN) atau DataStream (Tor). Keduanya
-/// mengimplementasikan tokio AsyncRead/AsyncWrite, didelegasikan di bawah.
 pub enum Conn {
     Tcp(TcpStream),
     Tor(DataStream),
@@ -103,26 +93,22 @@ fn role_from_fp(my_fp: &str, target_fp: &str) -> Role {
     }
 }
 
-/// Timeout total untuk Initiator mencoba dial .onion peer (dengan retry).
 const TOR_DIAL_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Delay antar retry dial Tor.
 const TOR_DIAL_RETRY_DELAY: Duration = Duration::from_secs(8);
-
-/// Timeout Responder menunggu koneksi masuk dari Initiator via Tor.
 const TOR_ACCEPT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Bangun koneksi ke peer dengan fallback LAN-first → Tor.
 ///
-/// - `lan`: mode jalur LAN.
-/// - `onion`: onion address peer (untuk fallback Tor); None bila kontak LAN-only.
-/// - `tor`: konteks Tor aktif (None bila online).
+/// `our_tor_auth_secret`: secret seed kunci client auth kita (SEC-13). Dipakai
+/// untuk inject ke keystore arti sebelum dial ke onion peer yang punya
+/// restricted discovery. Wajib diisi bila online; None berarti tidak di-inject.
 pub async fn establish(
     my_fp: &str,
     target_fp: &str,
     lan: LanMode,
     onion: Option<&str>,
     tor: Option<&Arc<TorContext>>,
+    our_tor_auth_secret: Option<[u8; 32]>,
 ) -> Result<(Conn, Role), Error> {
     let role = match lan {
         LanMode::Dial(_) => Role::Initiator,
@@ -132,10 +118,7 @@ pub async fn establish(
 
     let tor_available = tor.is_some() && onion.is_some();
 
-    // 1) Coba LAN dulu (kecuali Off).
     if !matches!(lan, LanMode::Off) {
-        // Timeout LAN hanya berguna bila ada Tor untuk di-fallback. Di mode
-        // LAN-only, JANGAN menyerah — tunggu peer masuk room (sampai Esc).
         let timeout = match lan {
             LanMode::Auto if tor_available => Some(LAN_AUTO_TIMEOUT),
             _ => None,
@@ -143,7 +126,6 @@ pub async fn establish(
         match try_lan(role, my_fp, target_fp, lan, timeout).await {
             Ok(tcp) => return Ok((Conn::Tcp(tcp), role)),
             Err(e) => {
-                // Hanya fallback bila Tor tersedia; jika tidak, kembalikan error LAN.
                 if !tor_available {
                     return Err(e);
                 }
@@ -151,11 +133,17 @@ pub async fn establish(
         }
     }
 
-    // 2) Fallback Tor — role deterministik, Initiator retry dial, Responder accept dengan timeout.
     let tor = tor.ok_or_else(|| Error::Tor("Tor tidak aktif".into()))?;
     match role {
         Role::Initiator => {
-            let host = onion.ok_or_else(|| Error::Tor("kontak tidak punya onion address".into()))?;
+            let host =
+                onion.ok_or_else(|| Error::Tor("kontak tidak punya onion address".into()))?;
+            // SEC-13: inject our client auth key sebelum dial agar arti bisa
+            // decrypt descriptor peer yang restricted. Gagal secara diam-diam
+            // — koneksi tetap dicoba (peer mungkin tidak pakai restricted discovery).
+            if let Some(secret) = our_tor_auth_secret {
+                let _ = tor.register_client_auth_key(host, secret).await;
+            }
             tor_dial_with_retry(tor, host).await.map(|ds| (Conn::Tor(ds), role))
         }
         Role::Responder => {
@@ -168,16 +156,7 @@ pub async fn establish(
     }
 }
 
-/// Dial .onion peer dengan retry dan exponential backoff.
-///
-/// Onion descriptor peer mungkin belum terpublikasikan ke Tor network (~1–3
-/// menit setelah bootstrap). Retry memastikan kita tidak menyerah saat
-/// descriptor belum siap — coba lagi setiap `TOR_DIAL_RETRY_DELAY` detik
-/// sampai total timeout `TOR_DIAL_TOTAL_TIMEOUT`.
-async fn tor_dial_with_retry(
-    tor: &Arc<TorContext>,
-    host: &str,
-) -> Result<DataStream, Error> {
+async fn tor_dial_with_retry(tor: &Arc<TorContext>, host: &str) -> Result<DataStream, Error> {
     let deadline = tokio::time::Instant::now() + TOR_DIAL_TOTAL_TIMEOUT;
 
     loop {
@@ -185,15 +164,13 @@ async fn tor_dial_with_retry(
             Ok(ds) => return Ok(ds),
             Err(e) => {
                 if tokio::time::Instant::now() + TOR_DIAL_RETRY_DELAY > deadline {
-                    return Err(e); // waktu habis — kembalikan error terakhir
+                    return Err(e);
                 }
                 tokio::time::sleep(TOR_DIAL_RETRY_DELAY).await;
             }
         }
     }
 }
-
-
 
 async fn try_lan(
     role: Role,
@@ -237,25 +214,19 @@ async fn lan_auto(role: Role, my_fp: &str, target_fp: &str) -> Result<TcpStream,
         Role::Initiator => {
             let (tx, mut rx) = mpsc::unbounded_channel();
             lan::spawn_browse(&daemon, tx)?;
-            // Peer multi-homed mengiklankan banyak IP (LAN asli + adapter virtual).
-            // Coba SEMUA: jangan menyerah pada satu connection-refused — alamat
-            // yang benar mungkin datang berikutnya. Konsisten dengan filosofi
-            // LAN-only "tunggu sampai peer bisa dijangkau" (sampai user Esc).
             let mut tried = std::collections::HashSet::new();
             let mut last_err = None;
             loop {
                 match rx.recv().await {
                     Some(peer) if peer.fingerprint == target_fp => {
                         if !tried.insert(peer.addr) {
-                            continue; // alamat ini sudah dicoba & gagal
+                            continue;
                         }
                         match TcpStream::connect(peer.addr).await {
                             Ok(stream) => {
                                 let _ = daemon.shutdown();
                                 return Ok(stream);
                             }
-                            // Alamat tak bisa di-connect (mis. adapter virtual /
-                            // port basi). Simpan error, lanjut coba alamat lain.
                             Err(e) => {
                                 last_err = Some(Error::Io(e));
                                 continue;

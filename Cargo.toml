@@ -1,6 +1,6 @@
 [package]
 name = "alter"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 # Dinaikkan dari 1.75 ke 1.89 di M2: arti-client 0.43.x (sesuai PRD) butuh rustc >= 1.89.
 rust-version = "1.89"
@@ -61,18 +61,23 @@ blake2 = "0.10"
 # Clipboard lintas platform (salin invite dengan tombol 'c')
 arboard = "3"
 
-# Tor (M2). default-features=false untuk drop native-tls/openssl (pakai rustls saja,
+# Tor (M2/M5). default-features=false untuk drop native-tls/openssl (pakai rustls saja,
 # penting agar build di Windows tidak butuh OpenSSL/perl).
-arti-client = { version = "0.43.0", default-features = false, features = ["tokio", "rustls", "onion-service-service", "onion-service-client", "compression"] }
+# M5: tambah experimental-api (insert_service_discovery_key) + restricted-discovery.
+arti-client = { version = "0.43.0", default-features = false, features = ["tokio", "rustls", "onion-service-service", "onion-service-client", "compression", "experimental-api", "restricted-discovery"] }
 tor-rtcompat = { version = "0.43.0", default-features = false, features = ["tokio", "rustls"] }
 
 # Compat futures<->tokio untuk StreamExt di tor.rs
 futures = "0.3.32"
 
 # Tipe Tor yang tidak di-reexport arti-client
-tor-hsservice = "0.43.0"   # OnionServiceConfigBuilder, handle_rend_requests, RunningOnionService
+tor-hsservice = { version = "0.43.0", features = ["restricted-discovery"] }  # OnionServiceConfigBuilder, restricted discovery
 tor-cell = "0.43.0"        # Connected (untuk StreamRequest::accept)
 safelog = "0.8"            # DisplayRedacted untuk ambil string .onion dari HsId
+
+# M5: kriptografi Tor untuk restricted discovery (client auth key types)
+tor-hscrypto = "0.43.0"    # HsClientDescEncKey, HsClientDescEncSecretKey, HsClientDescEncKeypair
+tor-llcrypto = "0.43.0"    # curve25519::StaticSecret, curve25519::PublicKey
 
 # rusqlite ditarik transitif oleh arti (state storage). Paksa fitur `bundled`
 # agar sqlite dikompilasi dari source — di Windows tidak ada sqlite3.lib sistem.

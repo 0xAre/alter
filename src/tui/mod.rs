@@ -26,6 +26,7 @@ use crate::contacts::{self, Contact};
 use crate::error::Error;
 use crate::identity::keypair::KeyBundle;
 use crate::identity::vault;
+use crate::platform;
 use crate::session::{self, SessionEvent, SessionState};
 use crate::transport::obfs4::Obfs4Status;
 use crate::transport::tor::TorContext;
@@ -33,7 +34,7 @@ use crate::transport::{self, LanMode};
 
 /// Material identitas milik sendiri (tersedia setelah unlock).
 ///
-/// `noise_sk` adalah secret key — wajib ZeroizeOnDrop (SEC-04).
+/// `noise_sk` dan `tor_client_auth_secret` adalah secret — ZeroizeOnDrop (SEC-04).
 #[derive(zeroize::ZeroizeOnDrop)]
 pub struct SelfKeys {
     #[zeroize(skip)]
@@ -45,9 +46,13 @@ pub struct SelfKeys {
     pub ed25519_pub: [u8; 32],
     #[zeroize(skip)]
     pub invite: String,
+    /// x25519 pubkey client auth (SEC-13) — dibagikan lewat invite v2.
+    #[zeroize(skip)]
+    pub tor_client_auth_pub: [u8; 32],
+    /// x25519 secret seed untuk decrypt restricted descriptor peer.
+    pub tor_client_auth_secret: [u8; 32],
 }
 
-/// Bagaimana jalur LAN dibangun (dipetakan ke transport::LanMode).
 #[derive(Clone, Copy)]
 pub enum ConnectKind {
     Auto,
@@ -65,24 +70,22 @@ impl From<ConnectKind> for LanMode {
     }
 }
 
-/// Layar utama aplikasi.
 #[derive(PartialEq, Eq)]
 pub(crate) enum Screen {
     Splash,
     Unlock,
     Create,
     Init,
-    /// Onboarding singkat — ditampilkan sekali setelah vault baru dibuat (R-07).
-    /// Menjelaskan model Room-Bound Sync agar user tidak kaget saat pesan "hilang".
     Onboard,
     Main,
 }
 
-/// Sub-mode di dalam layar Main.
 #[derive(PartialEq, Eq)]
 pub(crate) enum Mode {
     Browsing,
     AddContact,
+    /// UX-01: ganti nama kontak yang dipilih.
+    RenameContact,
     InRoom,
 }
 
@@ -119,7 +122,6 @@ impl ChatLine {
     }
 }
 
-/// Level notifikasi untuk status area.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NotifLevel {
     Error,
@@ -128,11 +130,9 @@ pub(crate) enum NotifLevel {
     Info,
 }
 
-/// Notifikasi bertipe — menggantikan `status: String`.
 pub(crate) struct Notification {
     pub level: NotifLevel,
     pub text: String,
-    /// Tick saat notifikasi harus otomatis hilang (None = persistent).
     pub dismiss_at: Option<u64>,
 }
 
@@ -152,33 +152,27 @@ impl Notification {
 }
 
 pub(crate) struct App {
-    // Identitas — None sampai vault dibuka.
     pub keys: Option<SelfKeys>,
     pub vault_path: PathBuf,
     pub tor: Option<Arc<TorContext>>,
-    /// True selama bootstrap Tor berjalan di latar belakang (untuk indikator UI).
     pub tor_connecting: bool,
+    /// SEC-13: true saat onion service di-restart untuk update restricted discovery.
+    pub tor_restarting: bool,
+    /// Sender untuk menerima hasil restart service dari background task.
+    tor_restart_result_tx: mpsc::UnboundedSender<Result<Arc<TorContext>, String>>,
     pub connect_kind: ConnectKind,
 
     pub screen: Screen,
-
-    // Splash timing
     pub splash_ticks: u64,
-
-    // Tick counter untuk spinner dan notifikasi auto-dismiss
     pub tick_count: u64,
-
-    // Init sequence: step 1-4, dan tick saat init dimulai
     pub init_step: u8,
     pub init_start_tick: u64,
 
-    // Unlock / create
     pub pass_input: String,
     pub pass_confirm: String,
     pub create_confirming: bool,
     pub auth_error: Option<String>,
 
-    // Main
     pub contacts: Vec<Contact>,
     pub selected: usize,
     pub mode: Mode,
@@ -187,21 +181,15 @@ pub(crate) struct App {
     pub messages: Vec<ChatLine>,
     pub input: String,
     pub add_buffer: String,
+    /// UX-01: buffer untuk rename kontak.
+    pub rename_buffer: String,
     pub notification: Option<Notification>,
     pub show_invite: bool,
     pub conn_task: Option<tokio::task::JoinHandle<()>>,
     pub contacts_key: Option<[u8; 32]>,
     pub pending_delete: Option<usize>,
-
-    // R-07: true jika onboarding harus tampil setelah init selesai (hanya vault baru).
     pub show_onboard_after_init: bool,
-
-    // SEC-06: ketersediaan obfs4proxy (deteksi saat startup).
     pub obfs4_status: Obfs4Status,
-
-    // SEC-11: panic wipe state.
-    // `panic_armed_tick` = tick saat tekan pertama Ctrl+Shift+X; None = tidak aktif.
-    // `should_panic_wipe` = true setelah tekan kedua dikonfirmasi; diproses loop utama.
     pub panic_armed_tick: Option<u64>,
     pub should_panic_wipe: bool,
 }
@@ -212,6 +200,7 @@ impl App {
         vault_exists: bool,
         connect_kind: ConnectKind,
         contacts: Vec<Contact>,
+        tor_restart_result_tx: mpsc::UnboundedSender<Result<Arc<TorContext>, String>>,
     ) -> Self {
         let screen = if vault_exists { Screen::Unlock } else { Screen::Create };
         Self {
@@ -219,6 +208,8 @@ impl App {
             vault_path,
             tor: None,
             tor_connecting: false,
+            tor_restarting: false,
+            tor_restart_result_tx,
             connect_kind,
             screen,
             splash_ticks: 0,
@@ -237,6 +228,7 @@ impl App {
             messages: Vec::new(),
             input: String::new(),
             add_buffer: String::new(),
+            rename_buffer: String::new(),
             notification: None,
             show_invite: false,
             conn_task: None,
@@ -271,27 +263,35 @@ fn build_self_keys(bundle: &KeyBundle, onion: Option<&str>) -> SelfKeys {
     let ed_pub = bundle.identity.public_key().to_bytes();
     let noise_pub = bundle.noise.public_bytes();
     let noise_sk = bundle.noise.secret_bytes();
-    SelfKeys {
+    let cap_pub = contacts::derive_tor_client_auth_pub(bundle);
+    let cap_secret = contacts::derive_tor_client_auth_secret_seed(bundle);
+    let invite = contacts::encode_invite(&ed_pub, &noise_pub, &cap_pub, onion);
+    let mut sk = SelfKeys {
         fingerprint: contacts::fingerprint(&ed_pub),
         noise_sk,
         noise_pub,
         ed25519_pub: ed_pub,
-        invite: contacts::encode_invite(&ed_pub, &noise_pub, onion),
-    }
+        invite,
+        tor_client_auth_pub: cap_pub,
+        tor_client_auth_secret: cap_secret,
+    };
+    // SEC-04: kunci secret ke RAM agar tidak di-swap ke disk.
+    platform::try_mlock(sk.noise_sk.as_mut_ptr(), 32);
+    platform::try_mlock(sk.tor_client_auth_secret.as_mut_ptr(), 32);
+    sk
 }
 
-/// Bangun ulang invite code menyertakan onion address bila Tor sudah siap.
+/// Bangun ulang invite code menyertakan onion address dan client_auth_pub bila siap.
 fn refresh_invite(app: &mut App) {
     let onion = app.tor.as_ref().map(|t| t.onion_address.clone());
     if let Some(k) = app.keys.as_mut() {
-        k.invite = contacts::encode_invite(&k.ed25519_pub, &k.noise_pub, onion.as_deref());
+        k.invite =
+            contacts::encode_invite(&k.ed25519_pub, &k.noise_pub, &k.tor_client_auth_pub, onion.as_deref());
     }
 }
 
-/// Durasi splash dalam tick (100ms/tick → 12 tick ≈ 1.2 detik).
 const SPLASH_TICKS: u64 = 12;
 
-/// Entry point TUI.
 pub async fn run(
     vault_path: PathBuf,
     vault_exists: bool,
@@ -299,10 +299,13 @@ pub async fn run(
     contacts: Vec<Contact>,
     mut tor_rx: Option<mpsc::UnboundedReceiver<Result<Arc<TorContext>, String>>>,
 ) -> Result<(), Error> {
-    let mut app = App::new(vault_path, vault_exists, connect_kind, contacts);
-    app.screen = Screen::Splash; // selalu mulai dari splash
+    // Channel untuk menerima hasil restart service dari background task (SEC-13).
+    let (restart_tx, mut restart_rx) =
+        mpsc::unbounded_channel::<Result<Arc<TorContext>, String>>();
 
-    // Tandai Tor sedang bootstrap (untuk indikator "tor·…" di header).
+    let mut app = App::new(vault_path, vault_exists, connect_kind, contacts, restart_tx);
+    app.screen = Screen::Splash;
+
     if tor_rx.is_some() {
         app.tor_connecting = true;
         app.set_notif_info("Menyambung ke Tor di latar belakang (~30-60 dtk)…");
@@ -353,6 +356,12 @@ pub async fn run(
                         app.tor = Some(ctx);
                         refresh_invite(&mut app);
                         app.set_notif_success("Tor siap — sekarang online (LAN + Tor).");
+                        // SEC-13: inject auth keys + restart service bila kontak sudah ada.
+                        inject_all_client_auth_keys(&app);
+                        let has_restricted = app.contacts.iter().any(|c| c.tor_client_auth_pub.is_some());
+                        if has_restricted {
+                            trigger_tor_restart(&mut app);
+                        }
                     }
                     Some(Err(e)) => {
                         app.set_notif_warn(format!("Tor gagal: {e}. Jalan mode LAN saja."));
@@ -362,10 +371,27 @@ pub async fn run(
                 app.tor_connecting = false;
                 tor_rx = None;
             }
+            maybe_restart = restart_rx.recv() => {
+                if let Some(res) = maybe_restart {
+                    match res {
+                        Ok(new_ctx) => {
+                            app.tor = Some(new_ctx);
+                            refresh_invite(&mut app);
+                            app.tor_restarting = false;
+                            app.set_notif_success("Restricted discovery diaktifkan.");
+                        }
+                        Err(e) => {
+                            app.tor_restarting = false;
+                            app.set_notif_warn(
+                                format!("Tor service restart gagal: {e}. Restricted discovery tidak aktif.")
+                            );
+                        }
+                    }
+                }
+            }
             _ = tick.tick() => {
                 app.tick_count += 1;
 
-                // Splash auto-advance ke auth setelah SPLASH_TICKS
                 if app.screen == Screen::Splash {
                     app.splash_ticks += 1;
                     if app.splash_ticks >= SPLASH_TICKS {
@@ -374,7 +400,6 @@ pub async fn run(
                     }
                 }
 
-                // Init sequence: setiap step tampil ~300ms, "Runtime ready." 500ms lalu auto-advance
                 if app.screen == Screen::Init {
                     let elapsed = app.tick_count.saturating_sub(app.init_start_tick);
                     app.init_step = match elapsed {
@@ -384,7 +409,6 @@ pub async fn run(
                         _      => 4,
                     };
                     if elapsed >= 14 {
-                        // R-07: tunjukkan onboarding setelah init hanya untuk vault baru.
                         if app.show_onboard_after_init {
                             app.screen = Screen::Onboard;
                         } else {
@@ -393,7 +417,6 @@ pub async fn run(
                     }
                 }
 
-                // Auto-dismiss notifikasi
                 if let Some(n) = &app.notification {
                     if let Some(dismiss_at) = n.dismiss_at {
                         if app.tick_count >= dismiss_at {
@@ -402,11 +425,9 @@ pub async fn run(
                     }
                 }
 
-                // SEC-11: reset panic arm setelah 3 detik (30 tick × 100ms)
                 if let Some(armed_tick) = app.panic_armed_tick {
                     if app.tick_count.saturating_sub(armed_tick) > 30 {
                         app.panic_armed_tick = None;
-                        // Hapus notifikasi panic jika masih tampil
                         if matches!(&app.notification, Some(n) if n.text.contains("PANIC")) {
                             app.notification = None;
                         }
@@ -416,9 +437,6 @@ pub async fn run(
         }
     };
 
-    // SEC-11: panic wipe — zeroize semua data sensitif sebelum cleanup terminal.
-    // `app.keys = None` memicu ZeroizeOnDrop pada SelfKeys.noise_sk (SEC-04).
-    // `app.tor = None` men-drop Arc<TorContext> → onion service mati segera.
     if app.should_panic_wipe {
         if let Some(h) = app.conn_task.take() {
             h.abort();
@@ -430,6 +448,7 @@ pub async fn run(
         app.messages.clear();
         app.input.clear();
         app.add_buffer.clear();
+        app.rename_buffer.clear();
     }
 
     disable_raw_mode()?;
@@ -471,24 +490,18 @@ fn spawn_input_thread(tx: mpsc::UnboundedSender<KeyEvent>) {
     });
 }
 
-/// SEC-11: proses tekan Ctrl+Shift+X (deteksi via uppercase 'X' + Ctrl).
-///
-/// Tekan pertama: arm (tampilkan peringatan, mulai countdown 3 detik).
-/// Tekan kedua dalam 30 tick (3 detik): konfirmasi panic wipe → return true (exit).
 fn handle_panic_hotkey(app: &mut App) -> bool {
     if let Some(armed_tick) = app.panic_armed_tick {
         if app.tick_count.saturating_sub(armed_tick) <= 30 {
-            // Tekan kedua dalam window — konfirmasi wipe
             app.should_panic_wipe = true;
             return true;
         }
     }
-    // Tekan pertama (atau sudah expired): arm
     app.panic_armed_tick = Some(app.tick_count);
     app.notification = Some(Notification {
         level: NotifLevel::Error,
         text: "⚠ PANIC — tekan Ctrl+Shift+X lagi dalam 3 detik untuk wipe & exit.".into(),
-        dismiss_at: None, // jangan auto-dismiss; direset oleh tick handler
+        dismiss_at: None,
     });
     false
 }
@@ -503,14 +516,12 @@ fn handle_key(
         return true;
     }
 
-    // SEC-11: Ctrl+Shift+X — 'X' uppercase mengindikasikan Shift ditekan.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('X') {
         return handle_panic_hotkey(app);
     }
 
     match app.screen {
         Screen::Splash => {
-            // Tombol apapun skip splash
             let vault_exists = app.vault_path.exists();
             app.screen = if vault_exists { Screen::Unlock } else { Screen::Create };
             false
@@ -519,7 +530,6 @@ fn handle_key(
         Screen::Create => handle_create_key(app, key),
         Screen::Init => handle_init_key(app, key),
         Screen::Onboard => {
-            // Tombol apapun dismiss onboarding → masuk Main
             app.screen = Screen::Main;
             false
         }
@@ -585,8 +595,6 @@ fn handle_create_key(app: &mut App, key: KeyEvent) -> bool {
                         app.auth_error = None;
                         app.init_step = 1;
                         app.init_start_tick = app.tick_count;
-                        // R-07: tunjukkan onboarding hanya pada vault baru — user
-                        // yang existing sudah familiar dengan model ephemeral.
                         app.screen = Screen::Init;
                         app.show_onboard_after_init = true;
                     }
@@ -624,9 +632,18 @@ fn try_unlock(app: &mut App) -> bool {
         Ok(bundle) => {
             app.contacts_key = Some(contacts::derive_contacts_key(&bundle));
             app.keys = Some(build_self_keys(&bundle, None));
-            refresh_invite(app); // sertakan onion bila Tor sudah siap
+            refresh_invite(app);
             app.auth_error = None;
             load_contacts_into(app);
+
+            // SEC-13: setelah unlock, inject semua client auth keys dan restart service
+            // bila ada kontak dengan restricted discovery.
+            inject_all_client_auth_keys(app);
+            let has_restricted = app.contacts.iter().any(|c| c.tor_client_auth_pub.is_some());
+            if app.tor.is_some() && has_restricted {
+                trigger_tor_restart(app);
+            }
+
             true
         }
         Err(_) => {
@@ -642,7 +659,7 @@ fn create_vault(app: &mut App) -> Result<(), Error> {
     vault::write_vault(&app.vault_path, &vault_bytes)?;
     app.contacts_key = Some(contacts::derive_contacts_key(&bundle));
     app.keys = Some(build_self_keys(&bundle, None));
-    refresh_invite(app); // sertakan onion bila Tor sudah siap
+    refresh_invite(app);
     load_contacts_into(app);
     Ok(())
 }
@@ -689,6 +706,48 @@ fn copy_invite(app: &mut App) {
     }
 }
 
+/// SEC-13: inject our client auth secret ke keystore arti untuk semua kontak
+/// yang punya onion address. Fire-and-forget — tidak memblok.
+fn inject_all_client_auth_keys(app: &App) {
+    let Some(tor) = app.tor.clone() else { return };
+    let Some(keys) = &app.keys else { return };
+    let our_secret = keys.tor_client_auth_secret;
+
+    let targets: Vec<String> = app.contacts.iter().filter_map(|c| c.onion.clone()).collect();
+    if targets.is_empty() {
+        return;
+    }
+
+    tokio::spawn(async move {
+        for onion in targets {
+            let _ = tor.register_client_auth_key(&onion, our_secret).await;
+        }
+    });
+}
+
+/// SEC-13: kumpulkan semua tor_client_auth_pub dari kontak dan restart service.
+///
+/// Dipanggil saat: (1) kontak baru dengan cap ditambah, (2) vault baru dibuka
+/// dengan kontak yang punya cap, (3) Tor baru siap dan sudah ada kontak cap.
+fn trigger_tor_restart(app: &mut App) {
+    let Some(tor) = app.tor.clone() else { return };
+
+    let auth_keys: Vec<[u8; 32]> = app
+        .contacts
+        .iter()
+        .filter_map(|c| c.tor_client_auth_pub)
+        .collect();
+
+    app.tor_restarting = true;
+    app.set_notif_info("Tor service restart untuk restricted discovery (~5s)…");
+
+    let tx = app.tor_restart_result_tx.clone();
+    tokio::spawn(async move {
+        let result = tor.restart_with_authorized_keys(&auth_keys).await.map_err(|e| e.to_string());
+        let _ = tx.send(result);
+    });
+}
+
 fn handle_main_key(
     app: &mut App,
     out_tx: &mut Option<mpsc::UnboundedSender<String>>,
@@ -715,6 +774,12 @@ fn handle_main_key(
                     app.mode = Mode::AddContact;
                     app.add_buffer.clear();
                     app.notification = None;
+                }
+                KeyCode::Char('r') => {
+                    if !app.contacts.is_empty() {
+                        app.rename_buffer = app.contacts[app.selected].nickname.clone();
+                        app.mode = Mode::RenameContact;
+                    }
                 }
                 KeyCode::Char('d') => {
                     if app.contacts.is_empty() {
@@ -746,6 +811,27 @@ fn handle_main_key(
             KeyCode::Backspace => { app.add_buffer.pop(); }
             KeyCode::Enter => add_contact_from_buffer(app),
             KeyCode::Char(c) => app.add_buffer.push(c),
+            _ => {}
+        },
+
+        Mode::RenameContact => match key.code {
+            KeyCode::Esc => {
+                app.mode = Mode::Browsing;
+                app.rename_buffer.clear();
+            }
+            KeyCode::Backspace => { app.rename_buffer.pop(); }
+            KeyCode::Enter => {
+                let new_name = app.rename_buffer.trim().to_string();
+                if !new_name.is_empty() && !app.contacts.is_empty() {
+                    let old_name = app.contacts[app.selected].nickname.clone();
+                    app.contacts[app.selected].nickname = new_name.clone();
+                    persist_contacts(app);
+                    app.set_notif_success(format!("[✓] '{old_name}' → '{new_name}'"));
+                }
+                app.mode = Mode::Browsing;
+                app.rename_buffer.clear();
+            }
+            KeyCode::Char(c) => app.rename_buffer.push(c),
             _ => {}
         },
 
@@ -796,12 +882,24 @@ fn start_connection(
     let onion = contact.onion.clone();
     let lan: LanMode = app.connect_kind.into();
     let tor = app.tor.clone();
+    // SEC-13: sertakan our_tor_auth_secret untuk inject ke arti keystore saat dial.
+    let our_auth_secret = keys.tor_client_auth_secret;
 
     let handle = tokio::spawn(async move {
         let _ = e_tx.send(SessionEvent::StateChanged(SessionState::Connecting));
-        match transport::establish(&my_fp, &target_fp, lan, onion.as_deref(), tor.as_ref()).await {
+        match transport::establish(
+            &my_fp,
+            &target_fp,
+            lan,
+            onion.as_deref(),
+            tor.as_ref(),
+            Some(our_auth_secret),
+        )
+        .await
+        {
             Ok((conn, role)) => {
-                let _ = session::run_session(conn, role, local_sk, Some(peer_pk), o_rx, e_tx).await;
+                let _ =
+                    session::run_session(conn, role, local_sk, Some(peer_pk), o_rx, e_tx).await;
             }
             Err(err) => {
                 let _ = e_tx.send(SessionEvent::Error(err.to_string()));
@@ -818,9 +916,7 @@ fn add_contact_from_buffer(app: &mut App) {
     let nick = parts.next().unwrap_or("").trim();
 
     match contacts::decode_invite(code) {
-        Ok((ed, noise, onion)) => {
-            // Cegah user menambah diri sendiri — fingerprint identik menyebabkan
-            // role_from_fp deadlock (kedua sisi jadi Responder).
+        Ok((ed, noise, cap, onion)) => {
             if let Some(keys) = &app.keys {
                 if ed == keys.ed25519_pub {
                     app.set_notif_error("[!] Tidak bisa menambah diri sendiri sebagai kontak.");
@@ -832,7 +928,12 @@ fn add_contact_from_buffer(app: &mut App) {
             } else {
                 nick.to_string()
             };
-            let via = if onion.is_some() { "LAN+Tor" } else { "LAN" };
+            let via = match (&onion, &cap) {
+                (Some(_), Some(_)) => "LAN+Tor (restricted discovery)",
+                (Some(_), None) => "LAN+Tor",
+                _ => "LAN",
+            };
+            let has_cap = cap.is_some();
             app.contacts.insert(
                 0,
                 Contact {
@@ -840,16 +941,25 @@ fn add_contact_from_buffer(app: &mut App) {
                     ed25519_pub: ed,
                     noise_pub: noise,
                     onion,
+                    tor_client_auth_pub: cap,
                 },
             );
             app.selected = 0;
             app.mode = Mode::Browsing;
             app.add_buffer.clear();
             persist_contacts(app);
+
+            // SEC-13: bila kontak v2 (punya cap), restart service dengan semua kunci.
+            if has_cap {
+                trigger_tor_restart(app);
+            }
+
             app.set_notif_success(format!("[✓] Kontak '{nickname}' ditambahkan ({via})."));
         }
         Err(_) => {
-            app.set_notif_error("[!] Invite code tidak valid.");
+            app.set_notif_error(
+                "[!] Invite code tidak valid. (Format v1 tidak lagi didukung — minta invite baru.)",
+            );
         }
     }
 }
@@ -903,12 +1013,8 @@ fn leave_room(
 fn handle_session_event(app: &mut App, se: SessionEvent) {
     match se {
         SessionEvent::StateChanged(state) => match state {
-            SessionState::Connecting => {
-                app.room = RoomState::Connecting;
-            }
-            SessionState::Handshaking => {
-                app.room = RoomState::Handshaking;
-            }
+            SessionState::Connecting => { app.room = RoomState::Connecting; }
+            SessionState::Handshaking => { app.room = RoomState::Handshaking; }
             SessionState::Active => {
                 app.room = RoomState::Open;
                 app.messages.push(ChatLine::system("Sesi aman terbuka.".into()));

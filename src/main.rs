@@ -227,15 +227,22 @@ fn build_self_keys(bundle: &KeyBundle, onion: Option<&str>) -> SelfKeys {
     let ed_pub = bundle.identity.public_key().to_bytes();
     let noise_pub = bundle.noise.public_bytes();
     let noise_sk = bundle.noise.secret_bytes();
+    let cap_pub = contacts::derive_tor_client_auth_pub(bundle);
+    let cap_secret = contacts::derive_tor_client_auth_secret_seed(bundle);
     let fingerprint = contacts::fingerprint(&ed_pub);
-    let invite = contacts::encode_invite(&ed_pub, &noise_pub, onion);
-    SelfKeys {
+    let invite = contacts::encode_invite(&ed_pub, &noise_pub, &cap_pub, onion);
+    let mut sk = SelfKeys {
         fingerprint,
         noise_sk,
         noise_pub,
         ed25519_pub: ed_pub,
         invite,
-    }
+        tor_client_auth_pub: cap_pub,
+        tor_client_auth_secret: cap_secret,
+    };
+    platform::try_mlock(sk.noise_sk.as_mut_ptr(), 32);
+    platform::try_mlock(sk.tor_client_auth_secret.as_mut_ptr(), 32);
+    sk
 }
 
 async fn real_main(args: Args) -> Result<(), Error> {
@@ -259,7 +266,7 @@ async fn real_main(args: Args) -> Result<(), Error> {
         let onion = if online {
             let (cache_dir, state_dir) = tor_dirs(&args.vault_path);
             eprintln!("Bootstrap Tor untuk ambil onion address (~30-60 dtk)…");
-            match TorContext::launch(&cache_dir, &state_dir, "alter-room").await {
+            match TorContext::launch(&cache_dir, &state_dir, "alter-room", &[]).await {
                 Ok(ctx) => Some(ctx.onion_address.clone()),
                 Err(e) => {
                     eprintln!("Tor gagal: {e} — invite jadi LAN-only.");
@@ -301,7 +308,7 @@ async fn real_main(args: Args) -> Result<(), Error> {
     let mut contact_list: Vec<Contact> = Vec::new();
     if let Some(code) = &args.add_invite {
         match contacts::decode_invite(code) {
-            Ok((ed, noise, onion)) => {
+            Ok((ed, noise, cap, onion)) => {
                 let nickname = args
                     .add_name
                     .clone()
@@ -311,10 +318,11 @@ async fn real_main(args: Args) -> Result<(), Error> {
                     ed25519_pub: ed,
                     noise_pub: noise,
                     onion,
+                    tor_client_auth_pub: cap,
                 });
             }
             Err(_) => {
-                eprintln!("Peringatan: invite code di --add tidak valid, dilewati.");
+                eprintln!("Peringatan: invite code di --add tidak valid (format v1 tidak didukung), dilewati.");
             }
         }
     }
@@ -325,7 +333,7 @@ async fn real_main(args: Args) -> Result<(), Error> {
         let (cache_dir, state_dir) = tor_dirs(&args.vault_path);
         let (tx, rx) = mpsc::unbounded_channel::<Result<Arc<TorContext>, String>>();
         tokio::spawn(async move {
-            let result = TorContext::launch(&cache_dir, &state_dir, "alter-room")
+            let result = TorContext::launch(&cache_dir, &state_dir, "alter-room", &[])
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(result);

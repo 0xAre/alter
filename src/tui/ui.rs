@@ -318,6 +318,9 @@ fn render_main(f: &mut Frame, app: &App) {
     if app.mode == Mode::AddContact {
         render_add_contact_modal(f, app, area);
     }
+    if app.mode == Mode::RenameContact {
+        render_rename_contact_modal(f, app, area);
+    }
     if app.show_invite {
         render_invite_popup(f, app, area);
     }
@@ -373,7 +376,10 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )
     };
-    let transport_pill: Span = if app.tor_active() {
+    let transport_pill: Span = if app.tor_restarting {
+        let spinner = SPINNER[(app.tick_count % SPINNER_LEN) as usize];
+        pill(format!(" {spinner} UPDATING "), WARNING)
+    } else if app.tor_active() {
         pill(" ◉ ONLINE ".to_string(), ACCENT)
     } else if app.tor_connecting {
         let spinner = SPINNER[(app.tick_count % SPINNER_LEN) as usize];
@@ -524,7 +530,7 @@ fn render_contacts(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_right_panel(f: &mut Frame, app: &App, area: Rect) {
     match app.mode {
-        Mode::Browsing | Mode::AddContact => render_idle_panel(f, app, area),
+        Mode::Browsing | Mode::AddContact | Mode::RenameContact => render_idle_panel(f, app, area),
         Mode::InRoom => render_chat_panel(f, app, area),
     }
 }
@@ -586,7 +592,7 @@ fn render_idle_panel(f: &mut Frame, app: &App, area: Rect) {
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "  [Enter] buka sesi   [d] hapus",
+                "  [Enter] buka sesi   [r] ubah nama   [d] hapus",
                 Style::default().fg(DIM),
             )),
         ];
@@ -753,6 +759,46 @@ fn render_add_contact_modal(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+// ─────────────────────────────── Rename Contact Modal ────────────────────────
+
+fn render_rename_contact_modal(f: &mut Frame, app: &App, area: Rect) {
+    let popup = centered_rect_abs(50, 8, area);
+    f.render_widget(Clear, popup);
+
+    let current = app.contacts.get(app.selected).map(|c| c.nickname.as_str()).unwrap_or("");
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "GANTI NAMA KONTAK",
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  Saat ini: {current}"),
+            Style::default().fg(DIM),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(app.rename_buffer.clone(), Style::default().fg(TEXT)),
+            Span::styled("▏", Style::default().fg(ACCENT)),
+        ]),
+        Line::from(""),
+    ];
+
+    f.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Left)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(ACCENT)),
+            ),
+        popup,
+    );
+}
+
 // ─────────────────────────────── Delete confirm ───────────────────────────────
 
 fn render_delete_confirm(f: &mut Frame, app: &App, area: Rect) {
@@ -802,11 +848,12 @@ fn footer_hint(app: &App) -> Line<'static> {
             k("[↑↓]"), d(" pilih   "),
             k("[Enter]"), d(" sesi   "),
             k("[a]"), d(" tambah   "),
+            k("[r]"), d(" ubah nama   "),
             k("[d]"), d(" hapus   "),
             k("[i]"), d(" identitas   "),
             k("[q]"), d(" keluar"),
         ]),
-        Mode::AddContact => Line::from(vec![
+        Mode::AddContact | Mode::RenameContact => Line::from(vec![
             d(" "),
             k("[Enter]"), d(" simpan   "),
             k("[Esc]"), d(" batal"),
