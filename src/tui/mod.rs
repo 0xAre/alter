@@ -984,14 +984,15 @@ fn handle_pm_main_key(app: &mut App, key: KeyEvent) -> bool {
             app.pm_search_active = true;
             app.pm_search.clear();
         }
-        KeyCode::Char('a') if !app.pm_is_readonly => {
+        KeyCode::Char('n') if !app.pm_is_readonly => {
             app.pm_add_service.clear();
             app.pm_add_username.clear();
             app.pm_add_password.clear();
             app.pm_add_field = 0;
+            app.auth_error = None;
             app.screen = Screen::PmAdd;
         }
-        KeyCode::Char('a') => {
+        KeyCode::Char('n') => {
             app.set_notif_warn("Mode baca — passphrase tidak dikenal, tidak bisa tambah entri.");
         }
         KeyCode::Char('d') if !app.pm_is_readonly => {
@@ -1005,11 +1006,37 @@ fn handle_pm_main_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('d') => {
             app.set_notif_warn("Mode baca — tidak bisa hapus entri.");
         }
-        KeyCode::Enter => {
-            // Reveal password 5 detik
+        KeyCode::Char('c') => {
+            // Copy password ke clipboard
             let visible = pm_visible_entries(app);
             if !visible.is_empty() {
-                app.pm_reveal_tick = Some(app.tick_count);
+                let pass = app.pm_entries[visible[app.pm_selected]].password.clone();
+                match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(pass)) {
+                    Ok(()) => app.set_notif_success("[✓] Password disalin ke clipboard"),
+                    Err(_) => app.set_notif_warn("Clipboard tidak tersedia"),
+                }
+            }
+        }
+        KeyCode::Char('u') => {
+            // Copy username ke clipboard
+            let visible = pm_visible_entries(app);
+            if !visible.is_empty() {
+                let uname = app.pm_entries[visible[app.pm_selected]].username.clone();
+                match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(uname)) {
+                    Ok(()) => app.set_notif_success("[✓] Username disalin ke clipboard"),
+                    Err(_) => app.set_notif_warn("Clipboard tidak tersedia"),
+                }
+            }
+        }
+        KeyCode::Enter => {
+            // Toggle reveal password — tampil/sembunyikan di detail panel
+            let visible = pm_visible_entries(app);
+            if !visible.is_empty() {
+                if app.pm_reveal_tick.is_some() {
+                    app.pm_reveal_tick = None; // sembunyikan
+                } else {
+                    app.pm_reveal_tick = Some(app.tick_count); // reveal 5 detik
+                }
             }
         }
         KeyCode::Up => {

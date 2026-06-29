@@ -993,186 +993,369 @@ fn format_fingerprint_short(fp: &str) -> String {
     fp.get(..6).unwrap_or(fp).to_string()
 }
 
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let t: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{t}…")
+    }
+}
+
 // ─── PM Main Screen ───────────────────────────────────────────────────────────
 
 pub(super) fn render_pm_main(f: &mut Frame, app: &App) {
     let area = f.area();
     let visible: Vec<usize> = pm_visible_entries(app);
 
-    // Layout: header | search bar | entry list | footer
-    let chunks = Layout::default()
+    // Layout: header(3) | search(3) | content(min) | footer(1)
+    let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // header
-            Constraint::Length(3),  // search bar
-            Constraint::Min(6),     // entry list
-            Constraint::Length(1),  // footer
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(1),
         ])
         .split(area);
 
-    // Header
-    let mode_label = if app.pm_is_readonly {
-        Span::styled(" Password Manager  [read-only] ", Style::default().fg(WARNING))
+    // ── Header ──────────────────────────────────────────────────────────────
+    let total = app.pm_entries.len();
+    let shown = visible.len();
+    let count_label = if app.pm_search.is_empty() {
+        format!(" {} entri ", total)
     } else {
-        Span::styled(" Password Manager ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+        format!(" {}/{} entri ", shown, total)
     };
-    let header = Paragraph::new(Line::from(mode_label))
-        .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(DIM)))
-        .alignment(Alignment::Center);
-    f.render_widget(header, chunks[0]);
+    let readonly_badge = if app.pm_is_readonly {
+        Span::styled(" READ-ONLY ", Style::default().fg(WARNING).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled(" ● aktif ", Style::default().fg(SUCCESS))
+    };
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled("  Password Manager", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(count_label, Style::default().fg(DIM)),
+        readonly_badge,
+    ])).block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(DIM)));
+    f.render_widget(header, outer[0]);
 
-    // Search bar
-    let search_indicator = if app.pm_search_active { "▸ " } else { "  " };
-    let search_text = if app.pm_search.is_empty() && !app.pm_search_active {
-        Span::styled("  [/] cari entri…", Style::default().fg(DIM))
+    // ── Search bar ──────────────────────────────────────────────────────────
+    let search_active = app.pm_search_active;
+    let search_content = if app.pm_search.is_empty() && !search_active {
+        Line::from(Span::styled("  [/] cari service, username…", Style::default().fg(DIM)))
     } else {
-        Span::raw(format!("{}{}{}", search_indicator, app.pm_search, if app.pm_search_active { "▏" } else { "" }))
+        Line::from(vec![
+            Span::styled("  / ", Style::default().fg(ACCENT)),
+            Span::styled(app.pm_search.clone(), Style::default().fg(TEXT)),
+            Span::styled(if search_active { "▏" } else { "" }, Style::default().fg(ACCENT)),
+        ])
     };
-    let search_bar = Paragraph::new(Line::from(search_text))
+    let search_bar = Paragraph::new(search_content)
         .block(Block::default().borders(Borders::ALL).border_style(
-            if app.pm_search_active {
-                Style::default().fg(ACCENT)
-            } else {
-                Style::default().fg(DIM)
-            }
+            if search_active { Style::default().fg(ACCENT) } else { Style::default().fg(DIM) }
         ));
-    f.render_widget(search_bar, chunks[1]);
+    f.render_widget(search_bar, outer[1]);
 
-    // Entry list
-    let items: Vec<ListItem> = if visible.is_empty() {
-        vec![ListItem::new(Line::from(Span::styled(
+    // ── Content: entry list (left 60%) | detail panel (right 40%) ──────────
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(outer[2]);
+
+    // Column widths based on left pane
+    let pane_w = panes[0].width.saturating_sub(6) as usize;
+    let svc_w  = (pane_w * 38 / 100).max(12);
+    let usr_w  = (pane_w * 34 / 100).max(10);
+
+    // Column header row
+    let col_sep = Span::styled("─".repeat(panes[0].width.saturating_sub(2) as usize), Style::default().fg(DIM));
+    let col_hdr = Line::from(vec![
+        Span::styled(format!("   {:<3}", "#"), Style::default().fg(DIM).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{:<w$}", "SERVICE", w = svc_w), Style::default().fg(DIM).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  {:<w$}", "USERNAME", w = usr_w), Style::default().fg(DIM).add_modifier(Modifier::BOLD)),
+        Span::styled("  PASSWORD", Style::default().fg(DIM).add_modifier(Modifier::BOLD)),
+    ]);
+
+    let mut list_lines: Vec<Line> = vec![col_hdr, Line::from(col_sep)];
+
+    if visible.is_empty() {
+        list_lines.push(Line::from(""));
+        list_lines.push(Line::from(Span::styled(
             if app.pm_search.is_empty() {
-                "  (belum ada entri — [n] tambah)"
+                "   Vault kosong — tekan [n] untuk tambah entri"
             } else {
-                "  (tidak ada hasil)"
+                "   Tidak ada entri yang cocok"
             },
             Style::default().fg(DIM),
-        )))]
+        )));
     } else {
-        visible.iter().enumerate().map(|(list_idx, &entry_idx)| {
-            let e = &app.pm_entries[entry_idx];
-            let selected = list_idx == app.pm_selected;
-            // Revealed password logic
-            let pass_str = if app.pm_reveal_tick.is_some() && selected {
+        for (list_idx, &entry_idx) in visible.iter().enumerate() {
+            let e       = &app.pm_entries[entry_idx];
+            let sel     = list_idx == app.pm_selected;
+            let pending = app.pm_pending_delete == Some(entry_idx);
+            let revealed = app.pm_reveal_tick.is_some() && sel;
+
+            let svc = truncate_str(&e.service, svc_w);
+            let usr = truncate_str(&e.username, usr_w);
+            let pass = if revealed {
                 e.password.clone()
             } else {
-                "•".repeat(e.password.len().min(12))
+                "•".repeat(e.password.len().min(16))
             };
-            let marker = if selected { "▶ " } else { "  " };
-            let style = if selected {
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(TEXT)
-            };
-            let pending_delete = app.pm_pending_delete == Some(entry_idx);
-            let line = if pending_delete {
+            let marker = if sel { "▶" } else { " " };
+            let num_str = format!("{:>3}", list_idx + 1);
+
+            list_lines.push(if pending {
                 Line::from(vec![
-                    Span::styled(format!("{}{}", marker, e.service), Style::default().fg(ERROR)),
-                    Span::styled("  [hapus? Enter=ya Esc=batal]", Style::default().fg(WARNING)),
+                    Span::styled(format!(" {} {} ", marker, num_str), Style::default().fg(ERROR)),
+                    Span::styled(format!("{:<w$}", svc, w = svc_w), Style::default().fg(ERROR)),
+                    Span::styled("  Hapus entri ini? ", Style::default().fg(DIM)),
+                    Span::styled("[y]", Style::default().fg(WARNING)),
+                    Span::styled(" ya  ", Style::default().fg(DIM)),
+                    Span::styled("[Esc]", Style::default().fg(DIM)),
+                    Span::styled(" batal", Style::default().fg(DIM)),
                 ])
             } else {
+                let row_sty = if sel {
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(TEXT)
+                };
+                let dim_sty = if sel { Style::default().fg(TEXT) } else { Style::default().fg(DIM) };
+                let pass_sty = if revealed {
+                    Style::default().fg(WARNING).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(DIM)
+                };
                 Line::from(vec![
-                    Span::styled(format!("{}{}", marker, e.service), style),
-                    Span::styled(
-                        format!("  {}  {}", e.username, pass_str),
-                        Style::default().fg(DIM),
-                    ),
+                    Span::styled(format!(" {} {} ", marker, num_str), row_sty),
+                    Span::styled(format!("{:<w$}", svc, w = svc_w), row_sty),
+                    Span::styled(format!("  {:<w$}", usr, w = usr_w), dim_sty),
+                    Span::styled(format!("  {}", pass), pass_sty),
                 ])
-            };
-            ListItem::new(line)
-        }).collect()
+            });
+        }
+    }
+
+    f.render_widget(
+        Paragraph::new(list_lines)
+            .block(Block::default().borders(Borders::ALL)
+                .border_style(Style::default().fg(DIM))
+                .title(Span::styled(
+                    format!(" Vault ({}) ", shown),
+                    Style::default().fg(ACCENT),
+                ))),
+        panes[0],
+    );
+
+    // ── Detail panel ────────────────────────────────────────────────────────
+    let detail_lines: Vec<Line> = if visible.is_empty() {
+        vec![
+            Line::from(""),
+            Line::from(Span::styled("  Tidak ada entri.", Style::default().fg(DIM))),
+            Line::from(""),
+            Line::from(Span::styled(
+                if app.pm_is_readonly { "  Mode read-only." } else { "  Tekan [n] untuk tambah." },
+                Style::default().fg(DIM),
+            )),
+        ]
+    } else {
+        let e       = &app.pm_entries[visible[app.pm_selected]];
+        let revealed = app.pm_reveal_tick.is_some();
+        let pass_display = if revealed {
+            e.password.clone()
+        } else {
+            "•".repeat(e.password.len().min(24))
+        };
+        let sep = Span::styled("─".repeat(panes[1].width.saturating_sub(4) as usize), Style::default().fg(DIM));
+        vec![
+            Line::from(""),
+            Line::from(Span::styled("  Service", Style::default().fg(DIM))),
+            Line::from(Span::styled(format!("  {}", e.service), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
+            Line::from(""),
+            Line::from(Span::styled("  Username", Style::default().fg(DIM))),
+            Line::from(Span::styled(format!("  {}", e.username), Style::default().fg(TEXT))),
+            Line::from(""),
+            Line::from(Span::styled("  Password", Style::default().fg(DIM))),
+            Line::from(Span::styled(
+                format!("  {}", pass_display),
+                if revealed {
+                    Style::default().fg(WARNING).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(TEXT)
+                },
+            )),
+            Line::from(""),
+            Line::from(sep),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  [Enter] ", Style::default().fg(ACCENT)),
+                Span::styled(
+                    if revealed { "sembunyikan" } else { "reveal password" },
+                    Style::default().fg(DIM),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  [c] ", Style::default().fg(ACCENT)),
+                Span::styled("copy password", Style::default().fg(DIM)),
+            ]),
+            Line::from(vec![
+                Span::styled("  [u] ", Style::default().fg(ACCENT)),
+                Span::styled("copy username", Style::default().fg(DIM)),
+            ]),
+        ]
     };
 
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(DIM))
-               .title(Span::styled(" Entri ", Style::default().fg(DIM))));
-    f.render_widget(list, chunks[2]);
+    f.render_widget(
+        Paragraph::new(detail_lines)
+            .block(Block::default().borders(Borders::ALL)
+                .border_style(Style::default().fg(DIM))
+                .title(Span::styled(" Detail ", Style::default().fg(DIM)))),
+        panes[1],
+    );
 
-    // Footer hints
-    let readonly_hints = vec![
-        d(" "), k("[↑↓]"), d(" pilih   "),
-        k("[Enter]"), d(" reveal   "),
-        k("[/]"), d(" cari   "),
-        k("[q]"), d(" keluar"),
-    ];
-    let edit_hints = vec![
-        d(" "), k("[↑↓]"), d(" pilih   "),
-        k("[n]"), d(" tambah   "),
-        k("[d]"), d(" hapus   "),
-        k("[Enter]"), d(" reveal   "),
-        k("[/]"), d(" cari   "),
-        k("[q]"), d(" keluar"),
-    ];
-    let hint_line = Line::from(if app.pm_is_readonly { readonly_hints } else { edit_hints });
-    render_footer(f, area, hint_line);
+    // ── Footer ──────────────────────────────────────────────────────────────
+    let hints: Vec<Span> = if app.pm_is_readonly {
+        vec![
+            d(" "), k("[↑↓]"), d(" pilih  "),
+            k("[Enter]"), d(" reveal  "),
+            k("[c]"), d(" copy pass  "),
+            k("[u]"), d(" copy user  "),
+            k("[/]"), d(" cari  "),
+            k("[q]"), d(" keluar"),
+        ]
+    } else {
+        vec![
+            d(" "), k("[↑↓]"), d(" pilih  "),
+            k("[n]"), d(" tambah  "),
+            k("[d]"), d(" hapus  "),
+            k("[Enter]"), d(" reveal  "),
+            k("[c]"), d(" copy pass  "),
+            k("[u]"), d(" copy user  "),
+            k("[/]"), d(" cari  "),
+            k("[q]"), d(" keluar"),
+        ]
+    };
+    render_footer(f, area, Line::from(hints));
 }
 
 // ─── PM Add Screen ────────────────────────────────────────────────────────────
 
 pub(super) fn render_pm_add(f: &mut Frame, app: &App) {
     let area = f.area();
-    let card = centered_rect_abs(60, 16, area);
+    // Modal 64 wide × 22 tall
+    let card = centered_rect_abs(64, 22, area);
     f.render_widget(Clear, card);
 
-    let field_names = ["Service / URL", "Username / Email", "Password"];
-    let field_values = [
-        app.pm_add_service.as_str(),
-        app.pm_add_username.as_str(),
-        app.pm_add_password.as_str(),
-    ];
-    let active_field = app.pm_add_field as usize;
+    let active = app.pm_add_field as usize;
 
-    let mut lines: Vec<Line> = vec![
-        Line::from(Span::styled(" Tambah Entri Baru ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
-        Line::from(""),
-    ];
+    // Outer block
+    let outer_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Span::styled(
+            "  Tambah Entri Baru  ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    let inner = outer_block.inner(card);
+    f.render_widget(outer_block, card);
 
-    for (i, (name, val)) in field_names.iter().zip(field_values.iter()).enumerate() {
-        let active = i == active_field;
-        let label_style = if active {
-            Style::default().fg(ACCENT)
-        } else {
-            Style::default().fg(DIM)
-        };
-        let display_val = if i == 2 && !active {
-            // Password field — mask when not focused
-            "•".repeat(val.len().min(20))
+    // Inner layout: step(1) + gap(1) + field×3(3 each) + gap(1) + error(1)
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Length(1), // step indicator
+            Constraint::Length(1), // spacer
+            Constraint::Length(3), // field 1
+            Constraint::Length(3), // field 2
+            Constraint::Length(3), // field 3
+            Constraint::Length(1), // error/empty
+        ])
+        .split(inner);
+
+    // Step indicator + progress dots
+    let dot = |i: usize| {
+        if i < active { Span::styled("● ", Style::default().fg(SUCCESS)) }
+        else if i == active { Span::styled("● ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)) }
+        else { Span::styled("○ ", Style::default().fg(DIM)) }
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            dot(0), Span::styled("Service  ", Style::default().fg(if active == 0 { ACCENT } else if active > 0 { SUCCESS } else { DIM })),
+            dot(1), Span::styled("Username  ", Style::default().fg(if active == 1 { ACCENT } else if active > 1 { SUCCESS } else { DIM })),
+            dot(2), Span::styled("Password", Style::default().fg(if active == 2 { ACCENT } else { DIM })),
+        ])),
+        chunks[0],
+    );
+
+    // Three field blocks
+    let defs: [(&str, &str, bool); 3] = [
+        ("Service / URL",    app.pm_add_service.as_str(),  false),
+        ("Username / Email", app.pm_add_username.as_str(), false),
+        ("Password",         app.pm_add_password.as_str(), true),
+    ];
+    for (i, (label, val, is_pass)) in defs.iter().enumerate() {
+        let is_active = i == active;
+        let display: String = if *is_pass && !is_active {
+            "•".repeat(val.len())
         } else {
             val.to_string()
         };
-        lines.push(Line::from(Span::styled(format!("  {}", name), label_style)));
-        let input_line = if active {
-            Line::from(Span::styled(
-                format!("  {}▏", display_val),
-                Style::default().fg(TEXT),
-            ))
+        let cursor = if is_active { "▏" } else { "" };
+
+        let border_sty = if is_active {
+            Style::default().fg(ACCENT)
+        } else if val.is_empty() {
+            Style::default().fg(DIM)
         } else {
-            Line::from(Span::styled(
-                format!("  {}", display_val),
-                Style::default().fg(if val.is_empty() { DIM } else { TEXT }),
-            ))
+            Style::default().fg(SUCCESS)
         };
-        lines.push(input_line);
-        lines.push(Line::from(""));
+        let title_sty = if is_active {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else if val.is_empty() {
+            Style::default().fg(DIM)
+        } else {
+            Style::default().fg(SUCCESS)
+        };
+        let check = if !val.is_empty() && !is_active { " ✓" } else { "" };
+
+        let field_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_sty)
+            .title(Span::styled(format!(" {}{} ", label, check), title_sty));
+        let text_sty = if is_active {
+            Style::default().fg(TEXT)
+        } else if val.is_empty() {
+            Style::default().fg(DIM)
+        } else {
+            Style::default().fg(TEXT)
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("{}{}", display, cursor),
+                text_sty,
+            ))).block(field_block),
+            chunks[i + 2],
+        );
     }
 
+    // Error row
     if let Some(err) = &app.auth_error {
-        lines.push(Line::from(Span::styled(
-            format!("  [!] {}", err),
-            Style::default().fg(ERROR),
-        )));
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                format!("[!] {}", err),
+                Style::default().fg(ERROR),
+            )),
+            chunks[5],
+        );
     }
 
-    let para = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(ACCENT)));
-    f.render_widget(para, card);
-
-    let hint_line = Line::from(vec![
-        d(" "), k("[Tab]"), d(" field berikut   "),
-        k("[Enter]"), d(" simpan   "),
+    render_footer(f, area, Line::from(vec![
+        d(" "), k("[Tab/↓]"), d(" field berikut  "),
+        k("[Enter]"), d(" lanjut / simpan  "),
         k("[Esc]"), d(" batal"),
-    ]);
-    render_footer(f, area, hint_line);
+    ]));
 }
 
 // ─── Migrate Screen ───────────────────────────────────────────────────────────
