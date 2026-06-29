@@ -1,6 +1,6 @@
 [package]
 name = "alter"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 # Dinaikkan dari 1.75 ke 1.89 di M2: arti-client 0.43.x (sesuai PRD) butuh rustc >= 1.89.
 rust-version = "1.89"
@@ -60,6 +60,10 @@ blake2 = "0.10"
 
 # Clipboard lintas platform (salin invite dengan tombol 'c')
 arboard = "3"
+
+# M6: serialisasi PM entries ke JSON (disimpan terenkripsi di slot A vault v2)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Tor (M2/M5). default-features=false untuk drop native-tls/openssl (pakai rustls saja,
 # penting agar build di Windows tidak butuh OpenSSL/perl).

@@ -25,6 +25,7 @@ use tokio::sync::mpsc;
 use crate::contacts::{self, Contact};
 use crate::error::Error;
 use crate::identity::keypair::KeyBundle;
+use crate::identity::pm::PmEntry;
 use crate::identity::vault;
 use crate::platform;
 use crate::session::{self, SessionEvent, SessionState};
@@ -70,6 +71,15 @@ impl From<ConnectKind> for LanMode {
     }
 }
 
+/// Fase pembuatan vault v2 baru (4-langkah karena butuh 2 passphrase).
+#[derive(PartialEq, Eq)]
+pub(crate) enum CreatePhase {
+    AlterPass,    // Langkah 1: masukkan passphrase ALTER
+    AlterConfirm, // Langkah 2: konfirmasi passphrase ALTER
+    PmPass,       // Langkah 3: masukkan passphrase PM (decoy)
+    PmConfirm,    // Langkah 4: konfirmasi passphrase PM
+}
+
 #[derive(PartialEq, Eq)]
 pub(crate) enum Screen {
     Splash,
@@ -78,6 +88,12 @@ pub(crate) enum Screen {
     Init,
     Onboard,
     Main,
+    /// M6: mode Password Manager (passphrase A cocok atau EmptyPm)
+    PmMain,
+    /// M6: form tambah entri PM baru
+    PmAdd,
+    /// M6: vault v1 terdeteksi → tampilkan prompt migrasi ke v2
+    Migrate,
 }
 
 #[derive(PartialEq, Eq)]
@@ -170,7 +186,11 @@ pub(crate) struct App {
 
     pub pass_input: String,
     pub pass_confirm: String,
-    pub create_confirming: bool,
+    /// M6: passphrase PM (slot A) — untuk Create multi-phase dan Migrate.
+    pub pm_pass_input: String,
+    pub pm_pass_confirm: String,
+    /// M6: fase saat ini dalam Create flow.
+    pub create_phase: CreatePhase,
     pub auth_error: Option<String>,
 
     pub contacts: Vec<Contact>,
@@ -192,6 +212,36 @@ pub(crate) struct App {
     pub obfs4_status: Obfs4Status,
     pub panic_armed_tick: Option<u64>,
     pub should_panic_wipe: bool,
+
+    // ─── M6: Password Manager state ──────────────────────────────────────
+    /// Entri PM yang sedang aktif di memori (di-zeroize saat panic wipe).
+    pub pm_entries: Vec<PmEntry>,
+    pub pm_selected: usize,
+    /// key_a (kunci slot A) — None jika EmptyPm (mode read-only).
+    pub pm_key: Option<zeroize::Zeroizing<[u8; 32]>>,
+    /// Bytes vault v2 saat ini (untuk update slot A tanpa re-seal slot B).
+    pub pm_vault_bytes: Option<Box<[u8; vault::VAULT_V2_SIZE]>>,
+    /// True jika passphrase tidak dikenal — PM kosong tidak bisa di-edit.
+    pub pm_is_readonly: bool,
+    /// Tick saat password di-reveal untuk auto-hide 5 detik (50 tick).
+    pub pm_reveal_tick: Option<u64>,
+    /// Entri yang menunggu konfirmasi hapus.
+    pub pm_pending_delete: Option<usize>,
+    /// Filter pencarian — kosong = tampilkan semua.
+    pub pm_search: String,
+    pub pm_search_active: bool,
+    // Form tambah entri baru
+    pub pm_add_service: String,
+    pub pm_add_username: String,
+    pub pm_add_password: String,
+    /// Field aktif di form PmAdd: 0=service, 1=username, 2=password.
+    pub pm_add_field: u8,
+
+    // ─── M6: Migrasi vault v1 → v2 ───────────────────────────────────────
+    /// Bundle sementara selama migrasi (dibuang setelah migrasi selesai).
+    pub migration_bundle: Option<KeyBundle>,
+    /// Fase migrasi: 0=masukkan PM pass, 1=konfirmasi PM pass.
+    pub migration_phase: u8,
 }
 
 impl App {
@@ -218,7 +268,9 @@ impl App {
             init_start_tick: 0,
             pass_input: String::new(),
             pass_confirm: String::new(),
-            create_confirming: false,
+            pm_pass_input: String::new(),
+            pm_pass_confirm: String::new(),
+            create_phase: CreatePhase::AlterPass,
             auth_error: None,
             contacts,
             selected: 0,
@@ -238,6 +290,21 @@ impl App {
             obfs4_status: crate::transport::obfs4::detect(),
             panic_armed_tick: None,
             should_panic_wipe: false,
+            pm_entries: Vec::new(),
+            pm_selected: 0,
+            pm_key: None,
+            pm_vault_bytes: None,
+            pm_is_readonly: false,
+            pm_reveal_tick: None,
+            pm_pending_delete: None,
+            pm_search: String::new(),
+            pm_search_active: false,
+            pm_add_service: String::new(),
+            pm_add_username: String::new(),
+            pm_add_password: String::new(),
+            pm_add_field: 0,
+            migration_bundle: None,
+            migration_phase: 0,
         }
     }
 
@@ -400,6 +467,13 @@ pub async fn run(
                     }
                 }
 
+                // M6: auto-hide password setelah 5 detik (50 tick × 100ms)
+                if let Some(reveal_tick) = app.pm_reveal_tick {
+                    if app.tick_count.saturating_sub(reveal_tick) >= 50 {
+                        app.pm_reveal_tick = None;
+                    }
+                }
+
                 if app.screen == Screen::Init {
                     let elapsed = app.tick_count.saturating_sub(app.init_start_tick);
                     app.init_step = match elapsed {
@@ -445,10 +519,25 @@ pub async fn run(
         app.keys = None;
         app.pass_input.zeroize();
         app.pass_confirm.zeroize();
+        app.pm_pass_input.zeroize();
+        app.pm_pass_confirm.zeroize();
         app.messages.clear();
         app.input.clear();
         app.add_buffer.clear();
         app.rename_buffer.clear();
+        // M6: wipe PM data sensitif
+        for entry in &mut app.pm_entries {
+            entry.password.zeroize();
+            entry.username.zeroize();
+            entry.service.zeroize();
+        }
+        app.pm_entries.clear();
+        app.pm_key = None;
+        app.pm_vault_bytes = None;
+        app.pm_add_password.zeroize();
+        app.pm_add_service.clear();
+        app.pm_add_username.clear();
+        app.migration_bundle = None;
     }
 
     disable_raw_mode()?;
@@ -534,6 +623,9 @@ fn handle_key(
             false
         }
         Screen::Main => handle_main_key(app, out_tx, ev_rx, key),
+        Screen::PmMain => handle_pm_main_key(app, key),
+        Screen::PmAdd => handle_pm_add_key(app, key),
+        Screen::Migrate => handle_migrate_key(app, key),
     }
 }
 
@@ -541,13 +633,27 @@ fn handle_unlock_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Esc => return true,
         KeyCode::Enter => {
-            if try_unlock(app) {
-                app.pass_input.zeroize();
-                app.init_step = 1;
-                app.init_start_tick = app.tick_count;
-                app.screen = Screen::Init;
-            } else {
-                app.pass_input.zeroize();
+            match try_unlock(app) {
+                UnlockResult::AlterOk => {
+                    app.pass_input.zeroize();
+                    app.init_step = 1;
+                    app.init_start_tick = app.tick_count;
+                    app.screen = Screen::Init;
+                }
+                UnlockResult::PmOk => {
+                    app.pass_input.zeroize();
+                    app.screen = Screen::PmMain;
+                }
+                UnlockResult::NeedsMigration => {
+                    // JANGAN zeroize pass_input — akan dipakai sebagai passphrase B saat migrasi
+                    app.auth_error = None;
+                    app.migration_phase = 0;
+                    app.screen = Screen::Migrate;
+                }
+                UnlockResult::Error(msg) => {
+                    app.pass_input.zeroize();
+                    app.auth_error = Some(msg);
+                }
             }
         }
         KeyCode::Backspace => { app.pass_input.pop(); }
@@ -557,53 +663,159 @@ fn handle_unlock_key(app: &mut App, key: KeyEvent) -> bool {
     false
 }
 
+/// Hasil dari `try_unlock` — menggantikan `bool` agar bisa bedakan 4 outcome.
+enum UnlockResult {
+    AlterOk,
+    PmOk,
+    NeedsMigration,
+    Error(String),
+}
+
+fn try_unlock(app: &mut App) -> UnlockResult {
+    let bytes = match vault::read_vault_raw(&app.vault_path) {
+        Ok(b) => b,
+        Err(_) => return UnlockResult::Error("Vault tidak terbaca.".into()),
+    };
+
+    match vault::detect_version(&bytes) {
+        vault::VaultVersion::V1 => {
+            let v1: [u8; vault::VAULT_SIZE] = match bytes.try_into() {
+                Ok(v) => v,
+                Err(_) => return UnlockResult::Error("Vault tidak valid.".into()),
+            };
+            match vault::unseal(&v1, app.pass_input.as_bytes()) {
+                Ok(bundle) => {
+                    // Simpan bundle sementara untuk dipakai saat migrasi
+                    app.migration_bundle = Some(bundle);
+                    UnlockResult::NeedsMigration
+                }
+                Err(_) => UnlockResult::Error("Passphrase salah atau vault rusak.".into()),
+            }
+        }
+
+        vault::VaultVersion::V2 => {
+            let v2: [u8; vault::VAULT_V2_SIZE] = match bytes.try_into() {
+                Ok(v) => v,
+                Err(_) => return UnlockResult::Error("Vault tidak valid.".into()),
+            };
+            match vault::open_v2(&v2, app.pass_input.as_bytes()) {
+                vault::VaultOpenResult::AlterMode(bundle) => {
+                    app.contacts_key = Some(contacts::derive_contacts_key(&bundle));
+                    app.keys = Some(build_self_keys(&bundle, None));
+                    refresh_invite(app);
+                    app.auth_error = None;
+                    load_contacts_into(app);
+                    inject_all_client_auth_keys(app);
+                    let has_restricted =
+                        app.contacts.iter().any(|c| c.tor_client_auth_pub.is_some());
+                    if app.tor.is_some() && has_restricted {
+                        trigger_tor_restart(app);
+                    }
+                    UnlockResult::AlterOk
+                }
+
+                vault::VaultOpenResult::PmMode { pm_entries, pm_key } => {
+                    app.pm_entries = pm_entries;
+                    let mut zk = zeroize::Zeroizing::new(pm_key);
+                    platform::try_mlock((&mut *zk).as_mut_ptr(), 32);
+                    app.pm_key = Some(zk);
+                    app.pm_vault_bytes = Some(Box::new(v2));
+                    app.pm_is_readonly = false;
+                    UnlockResult::PmOk
+                }
+
+                vault::VaultOpenResult::EmptyPm => {
+                    // Passphrase tidak dikenal → PM kosong, read-only
+                    app.pm_entries = Vec::new();
+                    app.pm_key = None;
+                    app.pm_vault_bytes = Some(Box::new(v2));
+                    app.pm_is_readonly = true;
+                    UnlockResult::PmOk
+                }
+            }
+        }
+
+        vault::VaultVersion::Unknown => {
+            UnlockResult::Error("Format vault tidak dikenal.".into())
+        }
+    }
+}
+
 fn handle_create_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Esc => return true,
-        KeyCode::Backspace => {
-            if app.create_confirming {
-                app.pass_confirm.pop();
-            } else {
-                app.pass_input.pop();
-            }
-        }
-        KeyCode::Char(c) => {
-            if app.create_confirming {
-                app.pass_confirm.push(c);
-            } else {
-                app.pass_input.push(c);
-            }
-        }
-        KeyCode::Enter => {
-            if !app.create_confirming {
+        KeyCode::Backspace => match app.create_phase {
+            CreatePhase::AlterPass    => { app.pass_input.pop(); }
+            CreatePhase::AlterConfirm => { app.pass_confirm.pop(); }
+            CreatePhase::PmPass       => { app.pm_pass_input.pop(); }
+            CreatePhase::PmConfirm    => { app.pm_pass_confirm.pop(); }
+        },
+        KeyCode::Char(c) => match app.create_phase {
+            CreatePhase::AlterPass    => app.pass_input.push(c),
+            CreatePhase::AlterConfirm => app.pass_confirm.push(c),
+            CreatePhase::PmPass       => app.pm_pass_input.push(c),
+            CreatePhase::PmConfirm    => app.pm_pass_confirm.push(c),
+        },
+        KeyCode::Enter => match app.create_phase {
+            CreatePhase::AlterPass => {
                 if app.pass_input.is_empty() {
-                    app.auth_error = Some("Passphrase tidak boleh kosong.".into());
+                    app.auth_error = Some("Passphrase ALTER tidak boleh kosong.".into());
                 } else {
                     app.auth_error = None;
-                    app.create_confirming = true;
+                    app.create_phase = CreatePhase::AlterConfirm;
                 }
-            } else if app.pass_confirm != app.pass_input {
-                app.auth_error = Some("Passphrase tidak cocok. Ulangi.".into());
-                app.pass_input.zeroize();
-                app.pass_confirm.zeroize();
-                app.create_confirming = false;
-            } else {
-                match create_vault(app) {
-                    Ok(()) => {
-                        app.pass_input.zeroize();
-                        app.pass_confirm.zeroize();
-                        app.auth_error = None;
-                        app.init_step = 1;
-                        app.init_start_tick = app.tick_count;
-                        app.screen = Screen::Init;
-                        app.show_onboard_after_init = true;
-                    }
-                    Err(_) => {
-                        app.auth_error = Some("Gagal membuat vault.".into());
+            }
+            CreatePhase::AlterConfirm => {
+                if app.pass_confirm != app.pass_input {
+                    app.auth_error = Some("Passphrase ALTER tidak cocok. Ulangi.".into());
+                    app.pass_input.zeroize();
+                    app.pass_confirm.zeroize();
+                    app.create_phase = CreatePhase::AlterPass;
+                } else {
+                    app.pass_confirm.zeroize();
+                    app.auth_error = None;
+                    app.create_phase = CreatePhase::PmPass;
+                }
+            }
+            CreatePhase::PmPass => {
+                if app.pm_pass_input.is_empty() {
+                    app.auth_error = Some("Passphrase PM tidak boleh kosong.".into());
+                } else if app.pm_pass_input == app.pass_input {
+                    app.auth_error = Some(
+                        "Passphrase PM tidak boleh sama dengan passphrase ALTER.".into(),
+                    );
+                } else {
+                    app.auth_error = None;
+                    app.create_phase = CreatePhase::PmConfirm;
+                }
+            }
+            CreatePhase::PmConfirm => {
+                if app.pm_pass_confirm != app.pm_pass_input {
+                    app.auth_error = Some("Passphrase PM tidak cocok. Ulangi.".into());
+                    app.pm_pass_input.zeroize();
+                    app.pm_pass_confirm.zeroize();
+                    app.create_phase = CreatePhase::PmPass;
+                } else {
+                    match create_vault_v2(app) {
+                        Ok(()) => {
+                            app.pass_input.zeroize();
+                            app.pass_confirm.zeroize();
+                            app.pm_pass_input.zeroize();
+                            app.pm_pass_confirm.zeroize();
+                            app.auth_error = None;
+                            app.create_phase = CreatePhase::AlterPass;
+                            app.init_step = 1;
+                            app.init_start_tick = app.tick_count;
+                            app.screen = Screen::Init;
+                            app.show_onboard_after_init = true;
+                        }
+                        Err(_) => {
+                            app.auth_error = Some("Gagal membuat vault.".into());
+                        }
                     }
                 }
             }
-        }
+        },
         _ => {}
     }
     false
@@ -620,48 +832,312 @@ fn handle_init_key(app: &mut App, key: KeyEvent) -> bool {
     false
 }
 
-fn try_unlock(app: &mut App) -> bool {
-    let vault_bytes = match vault::read_vault(&app.vault_path) {
-        Ok(v) => v,
-        Err(_) => {
-            app.auth_error = Some("Vault tidak terbaca.".into());
-            return false;
-        }
-    };
-    match vault::unseal(&vault_bytes, app.pass_input.as_bytes()) {
-        Ok(bundle) => {
-            app.contacts_key = Some(contacts::derive_contacts_key(&bundle));
-            app.keys = Some(build_self_keys(&bundle, None));
-            refresh_invite(app);
-            app.auth_error = None;
-            load_contacts_into(app);
 
-            // SEC-13: setelah unlock, inject semua client auth keys dan restart service
-            // bila ada kontak dengan restricted discovery.
-            inject_all_client_auth_keys(app);
-            let has_restricted = app.contacts.iter().any(|c| c.tor_client_auth_pub.is_some());
-            if app.tor.is_some() && has_restricted {
-                trigger_tor_restart(app);
-            }
-
-            true
-        }
-        Err(_) => {
-            app.auth_error = Some("Passphrase salah atau vault rusak.".into());
-            false
-        }
-    }
-}
-
-fn create_vault(app: &mut App) -> Result<(), Error> {
+fn create_vault_v2(app: &mut App) -> Result<(), Error> {
     let bundle = KeyBundle::generate();
-    let vault_bytes = vault::seal(&bundle, app.pass_input.as_bytes())?;
-    vault::write_vault(&app.vault_path, &vault_bytes)?;
+    let v2 = vault::create_v2(
+        &bundle,
+        app.pass_input.as_bytes(),
+        app.pm_pass_input.as_bytes(),
+    )?;
+    vault::write_vault_v2(&app.vault_path, &v2)?;
     app.contacts_key = Some(contacts::derive_contacts_key(&bundle));
     app.keys = Some(build_self_keys(&bundle, None));
     refresh_invite(app);
     load_contacts_into(app);
     Ok(())
+}
+
+// ─── Migrasi vault v1 → v2 ────────────────────────────────────────────────
+
+fn handle_migrate_key(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Esc => return true,
+        KeyCode::Backspace => {
+            if app.migration_phase == 0 {
+                app.pm_pass_input.pop();
+            } else {
+                app.pm_pass_confirm.pop();
+            }
+        }
+        KeyCode::Char(c) => {
+            if app.migration_phase == 0 {
+                app.pm_pass_input.push(c);
+            } else {
+                app.pm_pass_confirm.push(c);
+            }
+        }
+        KeyCode::Enter => {
+            if app.migration_phase == 0 {
+                if app.pm_pass_input.is_empty() {
+                    app.auth_error = Some("Passphrase PM tidak boleh kosong.".into());
+                } else if app.pm_pass_input == app.pass_input {
+                    app.auth_error = Some(
+                        "Passphrase PM tidak boleh sama dengan passphrase ALTER.".into(),
+                    );
+                } else {
+                    app.auth_error = None;
+                    app.migration_phase = 1;
+                }
+            } else {
+                if app.pm_pass_confirm != app.pm_pass_input {
+                    app.auth_error = Some("Passphrase tidak cocok. Ulangi.".into());
+                    app.pm_pass_input.zeroize();
+                    app.pm_pass_confirm.zeroize();
+                    app.migration_phase = 0;
+                } else {
+                    do_migrate(app);
+                }
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
+fn do_migrate(app: &mut App) {
+    let bundle = match app.migration_bundle.take() {
+        Some(b) => b,
+        None => {
+            app.auth_error = Some("State error: bundle tidak ada.".into());
+            return;
+        }
+    };
+
+    let v2 = match vault::create_v2(
+        &bundle,
+        app.pass_input.as_bytes(),
+        app.pm_pass_input.as_bytes(),
+    ) {
+        Ok(v) => v,
+        Err(_) => {
+            app.auth_error = Some("Gagal membuat vault v2.".into());
+            // Kembalikan bundle supaya bisa retry
+            // (sudah di-take — jika retry butuh re-unlock)
+            return;
+        }
+    };
+
+    if let Err(_) = vault::write_vault_v2(&app.vault_path, &v2) {
+        app.auth_error = Some("Gagal menulis vault ke disk.".into());
+        return;
+    }
+
+    // Setup ALTER mode
+    app.contacts_key = Some(contacts::derive_contacts_key(&bundle));
+    app.keys = Some(build_self_keys(&bundle, None));
+    refresh_invite(app);
+    load_contacts_into(app);
+    inject_all_client_auth_keys(app);
+    let has_restricted = app.contacts.iter().any(|c| c.tor_client_auth_pub.is_some());
+    if app.tor.is_some() && has_restricted {
+        trigger_tor_restart(app);
+    }
+
+    // Bersihkan state sensitif
+    app.pass_input.zeroize();
+    app.pm_pass_input.zeroize();
+    app.pm_pass_confirm.zeroize();
+    app.migration_bundle = None;
+    app.migration_phase = 0;
+    app.auth_error = None;
+
+    app.init_step = 1;
+    app.init_start_tick = app.tick_count;
+    app.show_onboard_after_init = false;
+    app.screen = Screen::Init;
+}
+
+// ─── Password Manager TUI handlers ───────────────────────────────────────
+
+fn handle_pm_main_key(app: &mut App, key: KeyEvent) -> bool {
+    // Mode pencarian aktif
+    if app.pm_search_active {
+        match key.code {
+            KeyCode::Esc => {
+                app.pm_search_active = false;
+                app.pm_search.clear();
+                app.pm_selected = 0;
+            }
+            KeyCode::Backspace => { app.pm_search.pop(); app.pm_selected = 0; }
+            KeyCode::Char(c) => { app.pm_search.push(c); app.pm_selected = 0; }
+            _ => {}
+        }
+        return false;
+    }
+
+    // Konfirmasi hapus
+    if let Some(idx) = app.pm_pending_delete {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => pm_delete_entry(app, idx),
+            _ => {
+                app.pm_pending_delete = None;
+                app.set_notif_info("Hapus dibatalkan.");
+            }
+        }
+        return false;
+    }
+
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => return true,
+        KeyCode::Char('/') => {
+            app.pm_search_active = true;
+            app.pm_search.clear();
+        }
+        KeyCode::Char('a') if !app.pm_is_readonly => {
+            app.pm_add_service.clear();
+            app.pm_add_username.clear();
+            app.pm_add_password.clear();
+            app.pm_add_field = 0;
+            app.screen = Screen::PmAdd;
+        }
+        KeyCode::Char('a') => {
+            app.set_notif_warn("Mode baca — passphrase tidak dikenal, tidak bisa tambah entri.");
+        }
+        KeyCode::Char('d') if !app.pm_is_readonly => {
+            let visible = pm_visible_entries(app);
+            if visible.is_empty() {
+                app.set_notif_info("Tidak ada entri untuk dihapus.");
+            } else {
+                app.pm_pending_delete = Some(visible[app.pm_selected]);
+            }
+        }
+        KeyCode::Char('d') => {
+            app.set_notif_warn("Mode baca — tidak bisa hapus entri.");
+        }
+        KeyCode::Enter => {
+            // Reveal password 5 detik
+            let visible = pm_visible_entries(app);
+            if !visible.is_empty() {
+                app.pm_reveal_tick = Some(app.tick_count);
+            }
+        }
+        KeyCode::Up => {
+            if app.pm_selected > 0 {
+                app.pm_selected -= 1;
+            }
+        }
+        KeyCode::Down => {
+            let visible_count = pm_visible_entries(app).len();
+            if visible_count > 0 && app.pm_selected + 1 < visible_count {
+                app.pm_selected += 1;
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
+fn handle_pm_add_key(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Esc => {
+            app.pm_add_service.clear();
+            app.pm_add_username.clear();
+            app.pm_add_password.clear();
+            app.pm_add_field = 0;
+            app.screen = Screen::PmMain;
+        }
+        KeyCode::Tab | KeyCode::Down => {
+            if app.pm_add_field < 2 {
+                app.pm_add_field += 1;
+            }
+        }
+        KeyCode::Up => {
+            if app.pm_add_field > 0 {
+                app.pm_add_field -= 1;
+            }
+        }
+        KeyCode::Backspace => match app.pm_add_field {
+            0 => { app.pm_add_service.pop(); }
+            1 => { app.pm_add_username.pop(); }
+            _ => { app.pm_add_password.pop(); }
+        },
+        KeyCode::Char(c) => match app.pm_add_field {
+            0 => app.pm_add_service.push(c),
+            1 => app.pm_add_username.push(c),
+            _ => app.pm_add_password.push(c),
+        },
+        KeyCode::Enter => {
+            if app.pm_add_field < 2 {
+                app.pm_add_field += 1;
+            } else {
+                // Simpan entri baru
+                if app.pm_add_service.trim().is_empty() {
+                    app.set_notif_error("[!] Service tidak boleh kosong.");
+                } else {
+                    let new_id = app.pm_entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+                    let entry = PmEntry {
+                        id: new_id,
+                        service: app.pm_add_service.trim().to_string(),
+                        username: app.pm_add_username.trim().to_string(),
+                        password: app.pm_add_password.clone(),
+                    };
+                    app.pm_entries.push(entry);
+                    // Zeroize field password dari form
+                    app.pm_add_password.zeroize();
+                    app.pm_add_service.clear();
+                    app.pm_add_username.clear();
+                    app.pm_add_field = 0;
+                    pm_save(app);
+                    app.screen = Screen::PmMain;
+                }
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
+/// Indeks entries yang terlihat (setelah filter pencarian).
+pub(super) fn pm_visible_entries(app: &App) -> Vec<usize> {
+    let q = app.pm_search.to_lowercase();
+    app.pm_entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            q.is_empty() || e.service.to_lowercase().contains(&q)
+                || e.username.to_lowercase().contains(&q)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn pm_delete_entry(app: &mut App, idx: usize) {
+    app.pm_pending_delete = None;
+    if idx >= app.pm_entries.len() {
+        return;
+    }
+    let svc = app.pm_entries[idx].service.clone();
+    app.pm_entries.remove(idx);
+    // Sesuaikan pm_selected
+    let visible_count = pm_visible_entries(app).len();
+    if app.pm_selected >= visible_count && app.pm_selected > 0 {
+        app.pm_selected -= 1;
+    }
+    pm_save(app);
+    app.set_notif_info(format!("Entri '{}' dihapus.", svc));
+}
+
+fn pm_save(app: &mut App) {
+    let (vault_bytes, pm_key) = match (&app.pm_vault_bytes, &app.pm_key) {
+        (Some(v), Some(k)) => (*v.clone(), *k.clone()),
+        _ => {
+            app.set_notif_error("[!] Tidak bisa simpan — state PM tidak valid.");
+            return;
+        }
+    };
+
+    match vault::update_pm(&vault_bytes, &pm_key, &app.pm_entries) {
+        Ok(new_vault) => {
+            if vault::write_vault_v2(&app.vault_path, &new_vault).is_ok() {
+                app.pm_vault_bytes = Some(Box::new(new_vault));
+                app.set_notif_success("[✓] Tersimpan.");
+            } else {
+                app.set_notif_error("[!] Gagal menulis vault ke disk.");
+            }
+        }
+        Err(_) => app.set_notif_error("[!] Gagal enkripsi PM entries."),
+    }
 }
 
 fn contacts_file_path(vault_path: &Path) -> PathBuf {

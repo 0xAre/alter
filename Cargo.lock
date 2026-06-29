@@ -81,6 +81,8 @@ dependencies = [
  "rusqlite",
  "rustls",
  "safelog",
+ "serde",
+ "serde_json",
  "snow",
  "thiserror 2.0.18",
  "tokio",

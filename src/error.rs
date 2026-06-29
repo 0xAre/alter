@@ -41,4 +41,7 @@ pub enum Error {
     #[error("peer identity mismatch")]
     IdentityMismatch,
 
+    /// Vault PM slot A penuh — JSON PM entries melebihi batas maksimal.
+    #[error("password manager capacity exceeded")]
+    PmFull,
 }

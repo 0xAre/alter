@@ -204,20 +204,41 @@ fn read_passphrase(prompt: &str) -> Result<Zeroizing<String>, Error> {
 
 /// Muat vault dari disk, atau buat identitas baru bila belum ada.
 fn load_or_create_vault(path: &std::path::Path) -> Result<KeyBundle, Error> {
+    use vault::{VaultOpenResult, VaultVersion};
+
     if path.exists() {
-        let vault_bytes = vault::read_vault(path)?;
+        let raw = vault::read_vault_raw(path)?;
         let pass = read_passphrase("Passphrase: ")?;
-        vault::unseal(&vault_bytes, pass.as_bytes())
+        match vault::detect_version(&raw) {
+            VaultVersion::V1 => {
+                let bytes: [u8; vault::VAULT_SIZE] =
+                    raw.try_into().map_err(|_| Error::Decryption)?;
+                vault::unseal(&bytes, pass.as_bytes())
+            }
+            VaultVersion::V2 => {
+                let bytes: [u8; vault::VAULT_V2_SIZE] =
+                    raw.try_into().map_err(|_| Error::Decryption)?;
+                match vault::open_v2(&bytes, pass.as_bytes()) {
+                    VaultOpenResult::AlterMode(bundle) => Ok(bundle),
+                    _ => Err(Error::Decryption),
+                }
+            }
+            VaultVersion::Unknown => Err(Error::Decryption),
+        }
     } else {
         println!("Vault tidak ditemukan di {}.", path.display());
-        println!("Membuat identitas baru.");
-        let pass = read_passphrase("Buat passphrase: ")?;
-        if pass.is_empty() {
+        println!("Membuat identitas baru (format v2).");
+        let pass_b = read_passphrase("Buat passphrase ALTER: ")?;
+        if pass_b.is_empty() {
+            return Err(Error::KeyDerivation);
+        }
+        let pass_a = read_passphrase("Buat passphrase Password Manager (decoy): ")?;
+        if pass_a.is_empty() {
             return Err(Error::KeyDerivation);
         }
         let bundle = KeyBundle::generate();
-        let vault_bytes = vault::seal(&bundle, pass.as_bytes())?;
-        vault::write_vault(path, &vault_bytes)?;
+        let vault_bytes = vault::create_v2(&bundle, pass_b.as_bytes(), pass_a.as_bytes())?;
+        vault::write_vault_v2(path, &vault_bytes)?;
         println!("Identitas dibuat dan disimpan.");
         Ok(bundle)
     }

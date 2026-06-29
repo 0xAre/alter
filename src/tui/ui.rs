@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::{App, Mode, NotifLevel, RoomState, Screen, Who};
+use super::{App, CreatePhase, Mode, NotifLevel, RoomState, Screen, Who, pm_visible_entries};
 
 
 // ─── ASCII logo ───────────────────────────────────────────────────────────────
@@ -53,6 +53,9 @@ pub(super) fn render(f: &mut Frame, app: &App) {
         Screen::Init => render_init(f, app),
         Screen::Onboard => render_onboard(f, app),
         Screen::Main => render_main(f, app),
+        Screen::PmMain => render_pm_main(f, app),
+        Screen::PmAdd => render_pm_add(f, app),
+        Screen::Migrate => render_migrate(f, app),
     }
 }
 
@@ -134,13 +137,23 @@ fn render_auth(f: &mut Frame, app: &App) {
     lines.push(Line::from(""));
 
     if creating {
-        let pass_active = !app.create_confirming;
-        lines.push(field_line("Passphrase  ", app.pass_input.len(), pass_active));
-        lines.push(field_line(
-            "Konfirmasi  ",
-            app.pass_confirm.len(),
-            app.create_confirming,
-        ));
+        // M6: 4-fase create — tampilkan field sesuai fase aktif
+        use CreatePhase::*;
+        let (alter_active, confirm_active, pm_active, pm_confirm_active) = match app.create_phase {
+            AlterPass    => (true,  false, false, false),
+            AlterConfirm => (false, true,  false, false),
+            PmPass       => (false, false, true,  false),
+            PmConfirm    => (false, false, false, true),
+        };
+        // Fase 1 & 2: ALTER passphrase
+        lines.push(Line::from(Span::styled("— passphrase ALTER (rahasia) —", Style::default().fg(DIM))));
+        lines.push(field_line("Passphrase  ", app.pass_input.len(), alter_active));
+        lines.push(field_line("Konfirmasi  ", app.pass_confirm.len(), confirm_active));
+        lines.push(Line::from(""));
+        // Fase 3 & 4: PM passphrase
+        lines.push(Line::from(Span::styled("— passphrase Password Manager (decoy) —", Style::default().fg(DIM))));
+        lines.push(field_line("Passphrase  ", app.pm_pass_input.len(), pm_active));
+        lines.push(field_line("Konfirmasi  ", app.pm_pass_confirm.len(), pm_confirm_active));
     } else {
         lines.push(Line::from(Span::styled(
             "Passphrase",
@@ -160,7 +173,7 @@ fn render_auth(f: &mut Frame, app: &App) {
         )));
     } else if creating {
         lines.push(Line::from(Span::styled(
-            "Passphrase mengenkripsi identitasmu secara lokal.",
+            "Dua passphrase untuk dua mode: ALTER + Password Manager.",
             Style::default().fg(DIM),
         )));
     }
@@ -978,4 +991,263 @@ fn format_fingerprint(fp: &str) -> String {
 
 fn format_fingerprint_short(fp: &str) -> String {
     fp.get(..6).unwrap_or(fp).to_string()
+}
+
+// ─── PM Main Screen ───────────────────────────────────────────────────────────
+
+pub(super) fn render_pm_main(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let visible: Vec<usize> = pm_visible_entries(app);
+
+    // Layout: header | search bar | entry list | footer
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // header
+            Constraint::Length(3),  // search bar
+            Constraint::Min(6),     // entry list
+            Constraint::Length(1),  // footer
+        ])
+        .split(area);
+
+    // Header
+    let mode_label = if app.pm_is_readonly {
+        Span::styled(" Password Manager  [read-only] ", Style::default().fg(WARNING))
+    } else {
+        Span::styled(" Password Manager ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+    };
+    let header = Paragraph::new(Line::from(mode_label))
+        .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(DIM)))
+        .alignment(Alignment::Center);
+    f.render_widget(header, chunks[0]);
+
+    // Search bar
+    let search_indicator = if app.pm_search_active { "▸ " } else { "  " };
+    let search_text = if app.pm_search.is_empty() && !app.pm_search_active {
+        Span::styled("  [/] cari entri…", Style::default().fg(DIM))
+    } else {
+        Span::raw(format!("{}{}{}", search_indicator, app.pm_search, if app.pm_search_active { "▏" } else { "" }))
+    };
+    let search_bar = Paragraph::new(Line::from(search_text))
+        .block(Block::default().borders(Borders::ALL).border_style(
+            if app.pm_search_active {
+                Style::default().fg(ACCENT)
+            } else {
+                Style::default().fg(DIM)
+            }
+        ));
+    f.render_widget(search_bar, chunks[1]);
+
+    // Entry list
+    let items: Vec<ListItem> = if visible.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            if app.pm_search.is_empty() {
+                "  (belum ada entri — [n] tambah)"
+            } else {
+                "  (tidak ada hasil)"
+            },
+            Style::default().fg(DIM),
+        )))]
+    } else {
+        visible.iter().enumerate().map(|(list_idx, &entry_idx)| {
+            let e = &app.pm_entries[entry_idx];
+            let selected = list_idx == app.pm_selected;
+            // Revealed password logic
+            let pass_str = if app.pm_reveal_tick.is_some() && selected {
+                e.password.clone()
+            } else {
+                "•".repeat(e.password.len().min(12))
+            };
+            let marker = if selected { "▶ " } else { "  " };
+            let style = if selected {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(TEXT)
+            };
+            let pending_delete = app.pm_pending_delete == Some(entry_idx);
+            let line = if pending_delete {
+                Line::from(vec![
+                    Span::styled(format!("{}{}", marker, e.service), Style::default().fg(ERROR)),
+                    Span::styled("  [hapus? Enter=ya Esc=batal]", Style::default().fg(WARNING)),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled(format!("{}{}", marker, e.service), style),
+                    Span::styled(
+                        format!("  {}  {}", e.username, pass_str),
+                        Style::default().fg(DIM),
+                    ),
+                ])
+            };
+            ListItem::new(line)
+        }).collect()
+    };
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(DIM))
+               .title(Span::styled(" Entri ", Style::default().fg(DIM))));
+    f.render_widget(list, chunks[2]);
+
+    // Footer hints
+    let readonly_hints = vec![
+        d(" "), k("[↑↓]"), d(" pilih   "),
+        k("[Enter]"), d(" reveal   "),
+        k("[/]"), d(" cari   "),
+        k("[q]"), d(" keluar"),
+    ];
+    let edit_hints = vec![
+        d(" "), k("[↑↓]"), d(" pilih   "),
+        k("[n]"), d(" tambah   "),
+        k("[d]"), d(" hapus   "),
+        k("[Enter]"), d(" reveal   "),
+        k("[/]"), d(" cari   "),
+        k("[q]"), d(" keluar"),
+    ];
+    let hint_line = Line::from(if app.pm_is_readonly { readonly_hints } else { edit_hints });
+    render_footer(f, area, hint_line);
+}
+
+// ─── PM Add Screen ────────────────────────────────────────────────────────────
+
+pub(super) fn render_pm_add(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let card = centered_rect_abs(60, 16, area);
+    f.render_widget(Clear, card);
+
+    let field_names = ["Service / URL", "Username / Email", "Password"];
+    let field_values = [
+        app.pm_add_service.as_str(),
+        app.pm_add_username.as_str(),
+        app.pm_add_password.as_str(),
+    ];
+    let active_field = app.pm_add_field as usize;
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(" Tambah Entri Baru ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+    ];
+
+    for (i, (name, val)) in field_names.iter().zip(field_values.iter()).enumerate() {
+        let active = i == active_field;
+        let label_style = if active {
+            Style::default().fg(ACCENT)
+        } else {
+            Style::default().fg(DIM)
+        };
+        let display_val = if i == 2 && !active {
+            // Password field — mask when not focused
+            "•".repeat(val.len().min(20))
+        } else {
+            val.to_string()
+        };
+        lines.push(Line::from(Span::styled(format!("  {}", name), label_style)));
+        let input_line = if active {
+            Line::from(Span::styled(
+                format!("  {}▏", display_val),
+                Style::default().fg(TEXT),
+            ))
+        } else {
+            Line::from(Span::styled(
+                format!("  {}", display_val),
+                Style::default().fg(if val.is_empty() { DIM } else { TEXT }),
+            ))
+        };
+        lines.push(input_line);
+        lines.push(Line::from(""));
+    }
+
+    if let Some(err) = &app.auth_error {
+        lines.push(Line::from(Span::styled(
+            format!("  [!] {}", err),
+            Style::default().fg(ERROR),
+        )));
+    }
+
+    let para = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(ACCENT)));
+    f.render_widget(para, card);
+
+    let hint_line = Line::from(vec![
+        d(" "), k("[Tab]"), d(" field berikut   "),
+        k("[Enter]"), d(" simpan   "),
+        k("[Esc]"), d(" batal"),
+    ]);
+    render_footer(f, area, hint_line);
+}
+
+// ─── Migrate Screen ───────────────────────────────────────────────────────────
+
+pub(super) fn render_migrate(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let card = centered_rect_abs(64, 14, area);
+    f.render_widget(Clear, card);
+
+    let phase = app.migration_phase;
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            " Migrasi Vault v1 → v2 ",
+            Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Vault lama terdeteksi. ALTER perlu upgrade ke format v2",
+            Style::default().fg(TEXT),
+        )),
+        Line::from(Span::styled(
+            "yang mendukung dual-slot (ALTER + Password Manager).",
+            Style::default().fg(TEXT),
+        )),
+        Line::from(""),
+    ];
+
+    match phase {
+        0 => {
+            // Masukkan PM passphrase baru
+            lines.push(Line::from(Span::styled(
+                "Buat passphrase untuk Password Manager (decoy):",
+                Style::default().fg(DIM),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("  Passphrase PM  {}▏", "•".repeat(app.pm_pass_input.len())),
+                Style::default().fg(TEXT),
+            )));
+        }
+        1 => {
+            // Konfirmasi PM passphrase
+            lines.push(Line::from(Span::styled(
+                "Konfirmasi passphrase Password Manager:",
+                Style::default().fg(DIM),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("  Konfirmasi     {}▏", "•".repeat(app.pm_pass_confirm.len())),
+                Style::default().fg(TEXT),
+            )));
+        }
+        _ => {
+            lines.push(Line::from(Span::styled(
+                "Memproses migrasi…",
+                Style::default().fg(ACCENT),
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+    if let Some(err) = &app.auth_error {
+        lines.push(Line::from(Span::styled(
+            format!("  [!] {}", err),
+            Style::default().fg(ERROR),
+        )));
+    }
+
+    let para = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(WARNING)));
+    f.render_widget(para, card);
+
+    let hint_line = Line::from(vec![
+        d(" "), k("[Enter]"), d(" lanjut   "),
+        k("[Esc]"), d(" keluar"),
+    ]);
+    render_footer(f, area, hint_line);
 }
