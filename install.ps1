@@ -1,8 +1,7 @@
 # ALTER Installer — Windows x64
-# Repo ini private. Butuh gh CLI + gh auth login sebagai collaborator.
 #
 # Install command:
-#   $t=(gh auth token); irm -H @{Authorization="Bearer $t"} https://raw.githubusercontent.com/0xAre/alter/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/0xAre/alter/main/install.ps1 | iex
 
 $ErrorActionPreference = "Stop"
 
@@ -20,17 +19,12 @@ Write-Host "  ALTER Installer" -ForegroundColor White
 Write-Host "  ==============================" -ForegroundColor DarkGray
 Write-Host ""
 
-# Cek gh CLI
-if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
-    Write-Err "gh CLI tidak ditemukan. Install: https://cli.github.com, lalu: gh auth login"
-}
-
-# Ambil release terbaru via gh (auth otomatis)
+# Ambil release terbaru via GitHub API (public)
 Write-Step "Mengecek release terbaru..."
 try {
-    $release = gh api repos/$repo/releases/latest | ConvertFrom-Json
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -UseBasicParsing
 } catch {
-    Write-Err "Gagal akses release. Pastikan sudah 'gh auth login' dan kamu adalah collaborator."
+    Write-Err "Gagal akses GitHub API. Cek koneksi internet: $_"
 }
 
 $version = $release.tag_name
@@ -55,12 +49,16 @@ Write-Step ("Download " + $asset.name + " (" + $sizeMB + " MB)...")
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 $destPath = Join-Path $installDir $binary
 
-# Download via gh (handles auth untuk private repo)
+# Download langsung dari GitHub Releases
 $tmp = Join-Path $env:TEMP $asset.name
-gh release download $version --repo $repo --pattern $asset.name --dir $env:TEMP --clobber 2>&1 | Out-Null
+try {
+    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $tmp -UseBasicParsing
+} catch {
+    Write-Err "Download gagal: $_"
+}
 
 if (-not (Test-Path $tmp)) {
-    Write-Err "Download gagal."
+    Write-Err "Download gagal — file tidak ditemukan."
 }
 
 Move-Item $tmp $destPath -Force
