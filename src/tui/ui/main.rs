@@ -13,11 +13,12 @@ use super::helpers::{
     footer_hint, format_fingerprint, format_fingerprint_short, render_footer, truncate_nick,
 };
 use super::modals::{
-    render_add_contact_modal, render_delete_confirm, render_invite_popup,
-    render_rename_contact_modal,
+    render_add_contact_modal, render_delete_confirm, render_file_received_modal,
+    render_invite_popup, render_rename_contact_modal, render_send_file_modal,
 };
 use super::super::app::App;
-use super::super::types::{Mode, NotifLevel, RoomState, Who};
+use super::super::types::{FileTransferUiState, Mode, NotifLevel, RoomState, Who};
+use super::super::chat::parse_reply_text;
 
 pub(super) fn render_main(f: &mut Frame, app: &App) {
     let area = f.area();
@@ -56,6 +57,12 @@ pub(super) fn render_main(f: &mut Frame, app: &App) {
     }
     if app.pending_delete.is_some() {
         render_delete_confirm(f, app, area);
+    }
+    if app.mode == Mode::SendFile {
+        render_send_file_modal(f, app, area);
+    }
+    if matches!(&app.file_transfer, FileTransferUiState::Received { .. }) {
+        render_file_received_modal(f, app, area);
     }
 }
 
@@ -257,7 +264,8 @@ pub(super) fn render_contacts(f: &mut Frame, app: &App, area: Rect) {
 pub(super) fn render_right_panel(f: &mut Frame, app: &App, area: Rect) {
     match app.mode {
         Mode::Browsing | Mode::AddContact | Mode::RenameContact => render_idle_panel(f, app, area),
-        Mode::InRoom => render_chat_panel(f, app, area),
+        // FT-01: SendFile tetap render panel chat (modal prompt di-overlay Fase 2).
+        Mode::InRoom | Mode::SendFile => render_chat_panel(f, app, area),
     }
 }
 
@@ -327,12 +335,13 @@ pub(super) fn render_idle_panel(f: &mut Frame, app: &App, area: Rect) {
 }
 
 pub(super) fn render_chat_panel(f: &mut Frame, app: &App, area: Rect) {
-    // Split: title | messages | separator | input
+    // Split: title | messages | ft-status | separator | input
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // title row (selaras dengan "CONTACTS")
             Constraint::Min(1),    // chat messages
+            Constraint::Length(1), // FT-01: status transfer aktif
             Constraint::Length(1), // separator
             Constraint::Length(1), // input line
         ])
@@ -379,14 +388,48 @@ pub(super) fn render_chat_panel(f: &mut Frame, app: &App, area: Rect) {
     };
     f.render_widget(Paragraph::new(Line::from(title_spans)), rows[0]);
 
-    // Chat messages
+    // Chat messages — dengan scroll support
     let inner_h = rows[1].height as usize;
-    let start = app.messages.len().saturating_sub(inner_h.max(1));
+    let total_msgs = app.messages.len();
+
+    // Hitung total visual lines (pesan reply = 2 baris, pesan biasa = 1 baris)
+    let total_visual: usize = app.messages.iter()
+        .map(|m| if parse_reply_text(&m.text).is_some() { 2 } else { 1 })
+        .sum();
+
+    // Clamp scroll agar tidak melebihi riwayat yang tersedia
+    let max_scroll = total_visual.saturating_sub(inner_h);
+    let effective_scroll = app.chat_scroll.min(max_scroll);
+
+    // Cari pesan mana yang harus mulai ditampilkan (dari bawah + scroll offset)
+    let mut visual_from_bottom = 0usize;
+    let mut start_msg_idx = total_msgs;
+    for (i, msg) in app.messages.iter().enumerate().rev() {
+        let msg_lines = if parse_reply_text(&msg.text).is_some() { 2 } else { 1 };
+        if visual_from_bottom >= inner_h + effective_scroll {
+            start_msg_idx = i + 1;
+            break;
+        }
+        visual_from_bottom += msg_lines;
+        if i == 0 {
+            start_msg_idx = 0;
+        }
+    }
+
     let mut lines: Vec<Line> = Vec::new();
 
-    // Messages
-    for msg in &app.messages[start..] {
-        lines.push(render_chat_line(msg));
+    // Indikator scroll atas — tampilkan berapa pesan di atas yang tidak terlihat
+    if effective_scroll > 0 {
+        let hidden = total_msgs.saturating_sub(start_msg_idx + inner_h);
+        lines.push(Line::from(Span::styled(
+            format!("  ↑  {} pesan lebih atas  [PageUp/PageDown]", hidden.max(effective_scroll)),
+            Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
+        )));
+    }
+
+    // Render messages dalam window
+    for msg in &app.messages[start_msg_idx..] {
+        lines.extend(render_chat_line(msg));
     }
 
     // Connecting/Handshaking spinner
@@ -407,27 +450,101 @@ pub(super) fn render_chat_panel(f: &mut Frame, app: &App, area: Rect) {
 
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), rows[1]);
 
-    // Input separator
-    render_separator(f, rows[2]);
+    // rows[2]: FT status, atau reply context bila tidak ada transfer aktif
+    let ft_line = match &app.file_transfer {
+        FileTransferUiState::None | FileTransferUiState::Prompting(..) => {
+            if let Some(ref quote) = app.replying_to {
+                Line::from(vec![
+                    Span::styled("  ↩ ", Style::default().fg(ACCENT)),
+                    Span::styled("Membalas: ", Style::default().fg(DIM)),
+                    Span::styled(
+                        format!("\"{quote}\""),
+                        Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
+                    ),
+                    Span::styled("  [Esc batal]", Style::default().fg(DIM)),
+                ])
+            } else {
+                Line::from("")
+            }
+        }
+        FileTransferUiState::Received { name, is_image, .. } => {
+            let hint = if *is_image { "[S] [L] [T]" } else { "[S] [T]" };
+            Line::from(vec![
+                Span::styled("  ✓ ", Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("'{name}' diterima  "), Style::default().fg(DIM)),
+                Span::styled(hint, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            ])
+        }
+        FileTransferUiState::Sending { name, total, sent } => {
+            let pct = if *total > 0 { sent * 100 / total } else { 0 };
+            let spinner = SPINNER[(app.tick_count % SPINNER_LEN) as usize];
+            Line::from(vec![
+                Span::styled(format!("  {spinner} "), Style::default().fg(WARNING)),
+                Span::styled(format!("Mengirim {name}  "), Style::default().fg(DIM)),
+                Span::styled(format!("{pct}%"), Style::default().fg(WARNING).add_modifier(Modifier::BOLD)),
+            ])
+        }
+        FileTransferUiState::Receiving { name, total, received } => {
+            let pct = if *total > 0 { received * 100 / total } else { 0 };
+            let spinner = SPINNER[(app.tick_count % SPINNER_LEN) as usize];
+            Line::from(vec![
+                Span::styled(format!("  {spinner} "), Style::default().fg(ACCENT)),
+                Span::styled(format!("Menerima {name}  "), Style::default().fg(DIM)),
+                Span::styled(format!("{pct}%"), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            ])
+        }
+    };
+    f.render_widget(Paragraph::new(ft_line), rows[2]);
 
-    // Input line — hanya visible saat room Open
-    let input_line = if app.room == RoomState::Open {
+    // Input separator (rows[3])
+    render_separator(f, rows[3]);
+
+    // Input line (rows[4]) — visible saat room Open, disembunyikan saat SendFile modal aktif
+    let input_line = if app.room == RoomState::Open && app.mode != Mode::SendFile {
+        let prompt = if app.replying_to.is_some() { "↩ " } else { "› " };
         Line::from(vec![
-            Span::styled("› ", Style::default().fg(ACCENT)),
+            Span::styled(prompt, Style::default().fg(ACCENT)),
             Span::styled(app.input.clone(), Style::default().fg(TEXT)),
             Span::styled("▏", Style::default().fg(ACCENT)),
         ])
+    } else if app.mode == Mode::SendFile {
+        Line::from("") // input tertutup modal kirim file
     } else {
         Line::from(Span::styled(
             "  [Esc] keluar sesi",
             Style::default().fg(DIM),
         ))
     };
-    f.render_widget(Paragraph::new(input_line), rows[3]);
+    f.render_widget(Paragraph::new(input_line), rows[4]);
 }
 
-pub(super) fn render_chat_line(line: &super::super::types::ChatLine) -> Line<'_> {
-    match line.who {
+pub(super) fn render_chat_line(line: &super::super::types::ChatLine) -> Vec<Line<'_>> {
+    // Cek apakah pesan adalah reply (format: `↩ "quote"\nactual`)
+    if let Some((quote, actual)) = parse_reply_text(&line.text) {
+        let (arrow, arrow_style, text_style) = match line.who {
+            Who::Me   => ("  → ", Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD), Style::default().fg(SUCCESS)),
+            Who::Peer => ("  ← ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),  Style::default()),
+            Who::System => ("  ·  ", Style::default().fg(DIM), Style::default().fg(DIM)),
+        };
+        return vec![
+            // Baris 1: kutipan (dim, italic)
+            Line::from(vec![
+                Span::styled("     ╷ ", Style::default().fg(DIM)),
+                Span::styled(
+                    format!("{quote}"),
+                    Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
+                ),
+            ]),
+            // Baris 2: actual reply
+            Line::from(vec![
+                Span::styled(arrow, arrow_style),
+                Span::styled(actual.to_string(), text_style),
+            ]),
+        ];
+    }
+
+    // Pesan biasa — satu baris
+    vec![match line.who {
         Who::Me => Line::from(vec![
             Span::styled("  → ", Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD)),
             Span::styled(line.text.clone(), Style::default().fg(SUCCESS)),
@@ -440,5 +557,5 @@ pub(super) fn render_chat_line(line: &super::super::types::ChatLine) -> Line<'_>
             format!("  ·  {}", line.text),
             Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
         )),
-    }
+    }]
 }

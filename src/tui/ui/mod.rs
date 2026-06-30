@@ -2,6 +2,7 @@
 
 mod auth;
 mod helpers;
+pub(super) mod image;
 mod main;
 mod migrate;
 mod modals;

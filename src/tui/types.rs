@@ -38,6 +38,21 @@ pub(crate) enum Mode {
     /// UX-01: ganti nama kontak yang dipilih.
     RenameContact,
     InRoom,
+    /// FT-01: prompt path file sebelum dikirim.
+    SendFile,
+}
+
+/// FT-01: state UI transfer file — sisi pengirim maupun penerima.
+pub(crate) enum FileTransferUiState {
+    None,
+    /// Header + byte data file; data sudah dibaca sekali di prepare_file_header
+    /// untuk menghindari TOCTOU antara kalkulasi SHA-256 dan pengiriman aktual.
+    Prompting(crate::session::file_transfer::FileHeader, Vec<u8>),
+    Receiving { name: String, total: u64, received: u64 },
+    Sending   { name: String, total: u64, sent: u64 },
+    /// Transfer selesai + SHA-256 verified. Menunggu pilihan user [S/L/T].
+    /// `is_image`: true jika mime=image/* dan ukuran ≤ 10 MB (opsi [L] tersedia).
+    Received  { name: String, data: Vec<u8>, is_image: bool },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -90,9 +105,6 @@ pub(crate) struct Notification {
 impl Notification {
     pub(crate) fn error(text: impl Into<String>) -> Self {
         Self { level: NotifLevel::Error, text: text.into(), dismiss_at: None }
-    }
-    pub(crate) fn warn(text: impl Into<String>) -> Self {
-        Self { level: NotifLevel::Warn, text: text.into(), dismiss_at: None }
     }
     pub(crate) fn success(tick: u64, text: impl Into<String>) -> Self {
         Self { level: NotifLevel::Success, text: text.into(), dismiss_at: Some(tick + 30) }

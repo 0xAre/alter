@@ -31,7 +31,7 @@ use zeroize::Zeroize;
 
 use crate::contacts::Contact;
 use crate::error::Error;
-use crate::session::SessionEvent;
+use crate::session::{SessionCmd, SessionEvent};
 use crate::transport::tor::TorContext;
 
 use app::refresh_invite;
@@ -39,7 +39,7 @@ use auth::{apply_unlock_result, handle_create_key, handle_init_key, handle_migra
 use chat::{handle_main_key, handle_session_event};
 use contact::{inject_all_client_auth_keys, trigger_tor_restart};
 use pm::{handle_pm_add_key, handle_pm_main_key};
-use types::{Notification, NotifLevel, Screen, UnlockComputed};
+use types::{FileTransferUiState, Notification, NotifLevel, Screen, UnlockComputed};
 
 const SPLASH_TICKS: u64 = 12;
 
@@ -71,12 +71,37 @@ pub async fn run(
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<KeyEvent>();
     spawn_input_thread(input_tx);
 
-    let mut out_tx: Option<mpsc::UnboundedSender<String>> = None;
+    let mut out_tx: Option<mpsc::UnboundedSender<SessionCmd>> = None;
     let mut ev_rx: Option<mpsc::UnboundedReceiver<SessionEvent>> = None;
 
     let mut tick = tokio::time::interval(Duration::from_millis(100));
 
     let result = loop {
+        // FT-01: image preview via viuer — render di luar alternate screen.
+        // Dipanggil sebelum draw() agar tidak terjadi race dengan ratatui buffer.
+        if let Some(image_data) = app.pending_image_render.take() {
+            let width = crossterm::terminal::size().map(|s| s.0).unwrap_or(80);
+            let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+            {
+                use std::io::Write as _;
+                print!("\r\n  Gambar dari peer:\r\n\r\n");
+                let _ = std::io::stdout().flush();
+            }
+            ui::image::render_image_inline(&image_data, width);
+            {
+                use std::io::Write as _;
+                print!("\r\n\r\n  Tekan sembarang tombol untuk kembali ke ALTER...\r\n");
+                let _ = std::io::stdout().flush();
+            }
+            // Tunggu satu key dari input thread (tetap raw mode, tidak perlu ganti)
+            if input_rx.recv().await.is_none() {
+                break Ok(());
+            }
+            let _ = execute!(io::stdout(), EnterAlternateScreen);
+            let _ = terminal.clear();
+            continue;
+        }
+
         if let Err(e) = terminal.draw(|f| ui::render(f, &app)) {
             break Err(Error::from(e));
         }
@@ -196,6 +221,22 @@ pub async fn run(
                         }
                     }
                 }
+
+                // FT-01: deteksi Prompting → kirim file ke session task.
+                // Data sudah ada di dalam enum Prompting (dibaca saat validasi, no TOCTOU).
+                if matches!(&app.file_transfer, FileTransferUiState::Prompting(..)) {
+                    let ft = std::mem::replace(&mut app.file_transfer, FileTransferUiState::None);
+                    if let FileTransferUiState::Prompting(header, data) = ft {
+                        let name = header.name.clone();
+                        let total = header.total_bytes;
+                        if let Some(tx) = &out_tx {
+                            let _ = tx.send(SessionCmd::SendFile { header, data });
+                            // sent=total: data sudah di-queue ke session task,
+                            // FileSent event akan mengubah ke None saat selesai terkirim.
+                            app.file_transfer = FileTransferUiState::Sending { name, total, sent: total };
+                        }
+                    }
+                }
             }
         }
     };
@@ -295,7 +336,7 @@ fn handle_panic_hotkey(app: &mut App) -> bool {
 
 fn handle_key(
     app: &mut App,
-    out_tx: &mut Option<mpsc::UnboundedSender<String>>,
+    out_tx: &mut Option<mpsc::UnboundedSender<SessionCmd>>,
     ev_rx: &mut Option<mpsc::UnboundedReceiver<SessionEvent>>,
     key: KeyEvent,
 ) -> bool {

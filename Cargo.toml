@@ -1,6 +1,6 @@
 [package]
 name = "alter"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 license = "GPL-3.0-only"
 # Dinaikkan dari 1.75 ke 1.89 di M2: arti-client 0.43.x (sesuai PRD) butuh rustc >= 1.89.
@@ -83,6 +83,19 @@ safelog = "0.8"            # DisplayRedacted untuk ambil string .onion dari HsId
 # M5: kriptografi Tor untuk restricted discovery (client auth key types)
 tor-hscrypto = "0.43.0"    # HsClientDescEncKey, HsClientDescEncSecretKey, HsClientDescEncKeypair
 tor-llcrypto = "0.43.0"    # curve25519::StaticSecret, curve25519::PublicKey
+
+# FT-01: render gambar di terminal (Kitty/Sixel/half-block auto-detect)
+# print-file: aktifkan viuer::print_from_file (baca dari path, bukan DynamicImage)
+viuer = { version = "0.9", features = ["print-file"] }
+
+# FT-01: deteksi MIME type dari magic bytes (bukan ekstensi file)
+infer = "0.16"
+
+# FT-01: tempfile untuk render_image_inline (viuer butuh path, bukan slice)
+tempfile = "3"
+
+# FT-01: SHA-256 untuk integritas end-to-end (sha2 sudah transitive, tapi deklarasi eksplisit)
+sha2 = "0.10"
 
 # rusqlite ditarik transitif oleh arti (state storage). Paksa fitur `bundled`
 # agar sqlite dikompilasi dari source — di Windows tidak ada sqlite3.lib sistem.

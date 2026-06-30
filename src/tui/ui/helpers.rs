@@ -87,6 +87,12 @@ pub(super) fn footer_hint(app: &App) -> Line<'static> {
             k("[Enter]"), d(" kirim   "),
             k("[Esc]"), d(" keluar sesi"),
         ]),
+        // FT-01 Fase 2: hint path-input + Esc batal akan dipasang di sini.
+        Mode::SendFile => Line::from(vec![
+            d(" "),
+            k("[Enter]"), d(" kirim file   "),
+            k("[Esc]"), d(" batal"),
+        ]),
     }
 }
 

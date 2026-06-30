@@ -16,7 +16,7 @@ use crate::transport::obfs4::Obfs4Status;
 use crate::transport::tor::TorContext;
 
 use super::types::{
-    ChatLine, CreatePhase, Mode, Notification, RoomState, Screen, UnlockComputed,
+    ChatLine, CreatePhase, FileTransferUiState, Mode, Notification, NotifLevel, RoomState, Screen, UnlockComputed,
 };
 
 /// Material identitas milik sendiri (tersedia setelah unlock).
@@ -149,6 +149,24 @@ pub struct App {
     // ─── Async unlock ─────────────────────────────────────────────────────
     /// Receiver hasil KDF dari background thread (aktif hanya saat Screen::Unlocking).
     pub unlock_rx: Option<mpsc::UnboundedReceiver<UnlockComputed>>,
+
+    // ─── FT-01: File Transfer ─────────────────────────────────────────────
+    /// State UI transfer file aktif (sisi pengirim atau penerima).
+    pub file_transfer: FileTransferUiState,
+    /// True jika peer mengumumkan dukungan file_transfer saat capability negotiation.
+    pub peer_ft_capable: bool,
+    /// Buffer path file saat Mode::SendFile prompt aktif.
+    pub send_file_buffer: String,
+    /// Bytes gambar yang menunggu render via viuer (setelah user pilih [L]).
+    /// Dibaca dan di-drop di event loop utama setelah terminal.draw().
+    pub pending_image_render: Option<Vec<u8>>,
+
+    // ─── UX: Chat scroll + Reply ──────────────────────────────────────────
+    /// Jumlah pesan yang di-scroll ke atas dari bawah (0 = posisi bawah / terbaru).
+    pub chat_scroll: usize,
+    /// Teks kutipan yang sedang dibalas; None jika tidak dalam mode reply.
+    /// Format di wire: `↩ "quote…"\nactual_reply`
+    pub replying_to: Option<String>,
 }
 
 impl App {
@@ -219,6 +237,12 @@ impl App {
             migration_bundle: None,
             migration_phase: 0,
             unlock_rx: None,
+            file_transfer: FileTransferUiState::None,
+            peer_ft_capable: false,
+            send_file_buffer: String::new(),
+            pending_image_render: None,
+            chat_scroll: 0,
+            replying_to: None,
         }
     }
 
@@ -236,7 +260,11 @@ impl App {
         self.notification = Some(Notification::info(self.tick_count, text));
     }
     pub(crate) fn set_notif_warn(&mut self, text: impl Into<String>) {
-        self.notification = Some(Notification::warn(text));
+        self.notification = Some(Notification {
+            level: NotifLevel::Warn,
+            text: text.into(),
+            dismiss_at: Some(self.tick_count + 80), // 8 detik (80 × 100ms)
+        });
     }
 }
 
