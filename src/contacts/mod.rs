@@ -20,6 +20,9 @@ use rand::rngs::OsRng;
 use crate::error::Error;
 use crate::identity::keypair::KeyBundle;
 
+const KDF_CLIENT_AUTH: &[u8] = b"alter-tor-client-auth-v1";
+const KDF_CONTACTS_KEY: &[u8] = b"alter-contacts-key-v1";
+
 /// Satu kontak yang dikenal.
 #[derive(Clone)]
 pub struct Contact {
@@ -31,6 +34,16 @@ pub struct Contact {
     /// Pubkey client auth Tor peer (dari invite v2). None = kontak legacy/LAN-only.
     /// Dipakai untuk mengkonfigurasi restricted discovery di onion service kita.
     pub tor_client_auth_pub: Option<[u8; 32]>,
+}
+
+/// Hasil decode invite code v2.
+pub struct DecodedInvite {
+    pub ed25519_pub: [u8; 32],
+    pub noise_pub: [u8; 32],
+    /// Pubkey client auth (None hanya untuk kode v1 yang sudah ditolak).
+    pub client_auth_pub: Option<[u8; 32]>,
+    /// Onion address peer. None = kontak LAN-only.
+    pub onion: Option<String>,
 }
 
 /// Fingerprint identitas = hex dari Ed25519 public key.
@@ -53,7 +66,7 @@ pub fn derive_tor_client_auth_pub(bundle: &KeyBundle) -> [u8; 32] {
 pub fn derive_tor_client_auth_secret_seed(bundle: &KeyBundle) -> [u8; 32] {
     let mut h = Blake2s256::new();
     h.update(bundle.identity.secret_bytes());
-    h.update(b"alter-tor-client-auth-v1");
+    h.update(KDF_CLIENT_AUTH);
     let digest = h.finalize();
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
@@ -80,13 +93,11 @@ pub fn encode_invite(
     }
 }
 
-/// Decode invite code v2 menjadi (ed25519_pub, noise_pub, client_auth_pub, onion).
+/// Decode invite code v2 menjadi `DecodedInvite`.
 ///
 /// Format v1 (64 byte) DITOLAK secara eksplisit (fail-closed per PRD): user harus
 /// menukar ulang invite code agar restricted discovery aktif bagi semua kontak.
-pub fn decode_invite(
-    code: &str,
-) -> Result<([u8; 32], [u8; 32], Option<[u8; 32]>, Option<String>), Error> {
+pub fn decode_invite(code: &str) -> Result<DecodedInvite, Error> {
     let code = code.trim();
     let (keys_part, onion) = match code.split_once('@') {
         Some((k, o)) if !o.is_empty() => (k, Some(o.to_string())),
@@ -106,7 +117,7 @@ pub fn decode_invite(
             ed.copy_from_slice(&raw[..32]);
             noise.copy_from_slice(&raw[32..64]);
             cap.copy_from_slice(&raw[64..96]);
-            Ok((ed, noise, Some(cap), onion))
+            Ok(DecodedInvite { ed25519_pub: ed, noise_pub: noise, client_auth_pub: Some(cap), onion })
         }
         64 => {
             // v1 legacy — tolak. Pengguna harus menukar invite code baru.
@@ -129,7 +140,7 @@ const C_NONCE_LEN: usize = 12;
 pub fn derive_contacts_key(bundle: &KeyBundle) -> [u8; 32] {
     let mut h = Blake2s256::new();
     h.update(bundle.identity.secret_bytes());
-    h.update(b"alter-contacts-key-v1");
+    h.update(KDF_CONTACTS_KEY);
     let digest = h.finalize();
     let mut key = [0u8; 32];
     key.copy_from_slice(&digest);
@@ -266,11 +277,11 @@ mod tests {
         let noise = [42u8; 32];
         let cap = [99u8; 32];
         let code = encode_invite(&ed, &noise, &cap, None);
-        let (ed2, noise2, cap2, onion) = decode_invite(&code).unwrap();
-        assert_eq!(ed, ed2);
-        assert_eq!(noise, noise2);
-        assert_eq!(cap2, Some(cap));
-        assert_eq!(onion, None);
+        let inv = decode_invite(&code).unwrap();
+        assert_eq!(ed, inv.ed25519_pub);
+        assert_eq!(noise, inv.noise_pub);
+        assert_eq!(inv.client_auth_pub, Some(cap));
+        assert_eq!(inv.onion, None);
     }
 
     #[test]
@@ -280,11 +291,11 @@ mod tests {
         let cap = [55u8; 32];
         let onion = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuv2y3d.onion";
         let code = encode_invite(&ed, &noise, &cap, Some(onion));
-        let (ed2, noise2, cap2, onion2) = decode_invite(&code).unwrap();
-        assert_eq!(ed, ed2);
-        assert_eq!(noise, noise2);
-        assert_eq!(cap2, Some(cap));
-        assert_eq!(onion2.as_deref(), Some(onion));
+        let inv = decode_invite(&code).unwrap();
+        assert_eq!(ed, inv.ed25519_pub);
+        assert_eq!(noise, inv.noise_pub);
+        assert_eq!(inv.client_auth_pub, Some(cap));
+        assert_eq!(inv.onion.as_deref(), Some(onion));
     }
 
     #[test]

@@ -2,6 +2,7 @@
 name = "alter"
 version = "0.5.0"
 edition = "2021"
+license = "GPL-3.0-only"
 # Dinaikkan dari 1.75 ke 1.89 di M2: arti-client 0.43.x (sesuai PRD) butuh rustc >= 1.89.
 rust-version = "1.89"
 
@@ -92,7 +93,6 @@ rusqlite = { version = "0.39", features = ["bundled"] }
 rustls = { version = "0.23", features = ["ring"] }
 
 [dev-dependencies]
-hex = "0.4"
 
 # SEC-09: prctl (Linux) / pthread_setname_np (macOS) untuk set nama proses.
 # Windows memakai SetConsoleTitleW via FFI langsung — tidak butuh libc.

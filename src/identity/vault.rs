@@ -69,7 +69,8 @@ fn derive_key(passphrase: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, Err
 }
 
 /// Enkripsi `bundle` ke dalam `[u8; VAULT_SIZE]` menggunakan `passphrase`.
-/// Hasil bisa langsung ditulis ke file — tidak perlu format wrapper apapun.
+/// Hanya digunakan di test (migration path dari vault v1) — produksi selalu pakai `create_v2`.
+#[cfg(test)]
 pub fn seal(bundle: &KeyBundle, passphrase: &[u8]) -> Result<[u8; VAULT_SIZE], Error> {
     // 1. Susun plaintext: [Ed25519 sk (32)] [X25519 sk (32)]
     let mut plaintext = Zeroizing::new([0u8; PLAINTEXT_LEN]);
@@ -138,20 +139,6 @@ pub fn unseal(vault: &[u8; VAULT_SIZE], passphrase: &[u8]) -> Result<KeyBundle, 
         identity: IdentityKey::from_secret_bytes(ed_bytes),
         noise: NoiseKey::from_secret_bytes(x25519_bytes),
     })
-}
-
-/// Tulis vault ke path yang diberikan. Filename dipilih oleh caller —
-/// ini sengaja agar aplikasi bisa pakai nama generik (SEC-05).
-pub fn write_vault(path: &std::path::Path, vault: &[u8; VAULT_SIZE]) -> Result<(), Error> {
-    std::fs::write(path, vault.as_slice()).map_err(Error::Io)
-}
-
-/// Baca vault dari disk.
-pub fn read_vault(path: &std::path::Path) -> Result<[u8; VAULT_SIZE], Error> {
-    let bytes = std::fs::read(path).map_err(Error::Io)?;
-    bytes
-        .try_into()
-        .map_err(|_| Error::Decryption) // ukuran salah → ambigu error
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -424,7 +411,7 @@ mod tests {
 
         // Tambah entries ke slot A
         let entries = vec![
-            PmEntry { id: 1, service: "github.com".into(), username: "alice".into(), password: "s3cr3t".into() },
+            PmEntry { id: 1, service: "github.com".into(), username: "alice".into(), password: "s3cr3t".into(), codes: None },
         ];
         let vault2 = update_pm(&vault, &{
             // Derive key_a untuk test
@@ -554,8 +541,8 @@ mod tests {
 
         // Tambah entry
         let entries = vec![
-            PmEntry { id: 1, service: "github.com".into(), username: "alice".into(), password: "p4ss".into() },
-            PmEntry { id: 2, service: "protonmail.com".into(), username: "alice@pm.me".into(), password: "xxxx".into() },
+            PmEntry { id: 1, service: "github.com".into(), username: "alice".into(), password: "p4ss".into(), codes: None },
+            PmEntry { id: 2, service: "protonmail.com".into(), username: "alice@pm.me".into(), password: "xxxx".into(), codes: None },
         ];
         let vault1 = update_pm(&vault0, &pm_key, &entries).unwrap();
 

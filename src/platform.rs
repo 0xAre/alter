@@ -53,8 +53,7 @@ fn set_impl(name: &str) {
 fn mlock_impl(ptr: *mut u8, len: usize) {
     unsafe {
         let _ = libc::mlock(ptr as *const _, len);
-        // MADV_DONTDUMP = 16: kecualikan halaman dari core dump
-        let _ = libc::madvise(ptr as *mut _, len, 16);
+        let _ = libc::madvise(ptr as *mut _, len, libc::MADV_DONTDUMP);
     }
 }
 

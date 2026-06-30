@@ -21,7 +21,7 @@ use crate::error::Error;
 use crate::identity::keypair::KeyBundle;
 use crate::identity::vault;
 use crate::transport::tor::TorContext;
-use crate::tui::{ConnectKind, SelfKeys};
+use crate::tui::{build_self_keys, ConnectKind};
 
 /// Argumen command line (parser manual — tanpa clap demi binary kecil).
 struct Args {
@@ -244,28 +244,6 @@ fn load_or_create_vault(path: &std::path::Path) -> Result<KeyBundle, Error> {
     }
 }
 
-fn build_self_keys(bundle: &KeyBundle, onion: Option<&str>) -> SelfKeys {
-    let ed_pub = bundle.identity.public_key().to_bytes();
-    let noise_pub = bundle.noise.public_bytes();
-    let noise_sk = bundle.noise.secret_bytes();
-    let cap_pub = contacts::derive_tor_client_auth_pub(bundle);
-    let cap_secret = contacts::derive_tor_client_auth_secret_seed(bundle);
-    let fingerprint = contacts::fingerprint(&ed_pub);
-    let invite = contacts::encode_invite(&ed_pub, &noise_pub, &cap_pub, onion);
-    let mut sk = SelfKeys {
-        fingerprint,
-        noise_sk,
-        noise_pub,
-        ed25519_pub: ed_pub,
-        invite,
-        tor_client_auth_pub: cap_pub,
-        tor_client_auth_secret: cap_secret,
-    };
-    platform::try_mlock(sk.noise_sk.as_mut_ptr(), 32);
-    platform::try_mlock(sk.tor_client_auth_secret.as_mut_ptr(), 32);
-    sk
-}
-
 async fn real_main(args: Args) -> Result<(), Error> {
     // Pastikan folder data (mis. ~/.alter) ada sebelum tulis vault / state Tor.
     if let Some(parent) = args.vault_path.parent() {
@@ -329,17 +307,17 @@ async fn real_main(args: Args) -> Result<(), Error> {
     let mut contact_list: Vec<Contact> = Vec::new();
     if let Some(code) = &args.add_invite {
         match contacts::decode_invite(code) {
-            Ok((ed, noise, cap, onion)) => {
+            Ok(inv) => {
                 let nickname = args
                     .add_name
                     .clone()
-                    .unwrap_or_else(|| format!("peer-{}", &contacts::fingerprint(&ed)[..8]));
+                    .unwrap_or_else(|| format!("peer-{}", &contacts::fingerprint(&inv.ed25519_pub)[..8]));
                 contact_list.push(Contact {
                     nickname,
-                    ed25519_pub: ed,
-                    noise_pub: noise,
-                    onion,
-                    tor_client_auth_pub: cap,
+                    ed25519_pub: inv.ed25519_pub,
+                    noise_pub: inv.noise_pub,
+                    onion: inv.onion,
+                    tor_client_auth_pub: inv.client_auth_pub,
                 });
             }
             Err(_) => {
