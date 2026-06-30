@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 use crate::contacts::{self, Contact};
 use crate::error::Error;
 use crate::identity::keypair::KeyBundle;
-use crate::identity::pm::PmEntry;
+use crate::identity::pm::{BackupCode, PmEntry, PM_CODES_MAX};
 use crate::identity::vault;
 use crate::platform;
 use crate::session::{self, SessionEvent, SessionState};
@@ -84,6 +84,8 @@ pub(crate) enum CreatePhase {
 pub(crate) enum Screen {
     Splash,
     Unlock,
+    /// Argon2id KDF berjalan di background thread — tampilkan spinner
+    Unlocking,
     Create,
     Init,
     Onboard,
@@ -234,14 +236,31 @@ pub(crate) struct App {
     pub pm_add_service: String,
     pub pm_add_username: String,
     pub pm_add_password: String,
-    /// Field aktif di form PmAdd: 0=service, 1=username, 2=password.
+    /// Field aktif di form PmAdd: 0=service, 1=username, 2=password, 3=backup codes.
     pub pm_add_field: u8,
+    /// Backup codes yang sedang diketik di form tambah (step 4).
+    pub pm_add_codes: Vec<String>,
+    pub pm_add_code_input: String,
+
+    // ─── PM Codes modal ──────────────────────────────────────────────────
+    /// True saat modal backup codes terbuka.
+    pub pm_codes_open: bool,
+    /// Indeks code yang sedang dipilih dalam modal.
+    pub pm_codes_selected: usize,
+    /// True saat user sedang mengetik code baru di modal.
+    pub pm_codes_add_mode: bool,
+    /// Buffer input code baru di modal.
+    pub pm_codes_input: String,
 
     // ─── M6: Migrasi vault v1 → v2 ───────────────────────────────────────
     /// Bundle sementara selama migrasi (dibuang setelah migrasi selesai).
     pub migration_bundle: Option<KeyBundle>,
     /// Fase migrasi: 0=masukkan PM pass, 1=konfirmasi PM pass.
     pub migration_phase: u8,
+
+    // ─── Async unlock ─────────────────────────────────────────────────────
+    /// Receiver hasil KDF dari background thread (aktif hanya saat Screen::Unlocking).
+    pub unlock_rx: Option<mpsc::UnboundedReceiver<UnlockComputed>>,
 }
 
 impl App {
@@ -303,8 +322,15 @@ impl App {
             pm_add_username: String::new(),
             pm_add_password: String::new(),
             pm_add_field: 0,
+            pm_add_codes: Vec::new(),
+            pm_add_code_input: String::new(),
+            pm_codes_open: false,
+            pm_codes_selected: 0,
+            pm_codes_add_mode: false,
+            pm_codes_input: String::new(),
             migration_bundle: None,
             migration_phase: 0,
+            unlock_rx: None,
         }
     }
 
@@ -456,6 +482,11 @@ pub async fn run(
                     }
                 }
             }
+            maybe_unlock = recv_unlock(&mut app.unlock_rx) => {
+                if let Some(computed) = maybe_unlock {
+                    apply_unlock_result(&mut app, computed);
+                }
+            }
             _ = tick.tick() => {
                 app.tick_count += 1;
 
@@ -556,6 +587,15 @@ async fn recv_session(
     }
 }
 
+async fn recv_unlock(
+    rx: &mut Option<mpsc::UnboundedReceiver<UnlockComputed>>,
+) -> Option<UnlockComputed> {
+    match rx.as_mut() {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn recv_tor(
     rx: &mut Option<mpsc::UnboundedReceiver<Result<Arc<TorContext>, String>>>,
 ) -> Option<Result<Arc<TorContext>, String>> {
@@ -616,6 +656,7 @@ fn handle_key(
             false
         }
         Screen::Unlock => handle_unlock_key(app, key),
+        Screen::Unlocking => false, // abaikan semua input saat KDF berjalan di background
         Screen::Create => handle_create_key(app, key),
         Screen::Init => handle_init_key(app, key),
         Screen::Onboard => {
@@ -633,26 +674,21 @@ fn handle_unlock_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Esc => return true,
         KeyCode::Enter => {
-            match try_unlock(app) {
-                UnlockResult::AlterOk => {
-                    app.pass_input.zeroize();
-                    app.init_step = 1;
-                    app.init_start_tick = app.tick_count;
-                    app.screen = Screen::Init;
+            match vault::read_vault_raw(&app.vault_path) {
+                Err(_) => {
+                    app.auth_error = Some("Vault tidak terbaca.".into());
                 }
-                UnlockResult::PmOk => {
-                    app.pass_input.zeroize();
-                    app.screen = Screen::PmMain;
-                }
-                UnlockResult::NeedsMigration => {
-                    // JANGAN zeroize pass_input — akan dipakai sebagai passphrase B saat migrasi
+                Ok(bytes) => {
+                    // Salin passphrase ke Vec agar bisa dipindah ke spawn_blocking
+                    let passphrase = zeroize::Zeroizing::new(app.pass_input.as_bytes().to_vec());
+                    let (tx, rx) = mpsc::unbounded_channel::<UnlockComputed>();
+                    app.unlock_rx = Some(rx);
                     app.auth_error = None;
-                    app.migration_phase = 0;
-                    app.screen = Screen::Migrate;
-                }
-                UnlockResult::Error(msg) => {
-                    app.pass_input.zeroize();
-                    app.auth_error = Some(msg);
+                    app.screen = Screen::Unlocking;
+                    tokio::task::spawn_blocking(move || {
+                        let computed = compute_unlock(bytes, &passphrase);
+                        let _ = tx.send(computed);
+                    });
                 }
             }
         }
@@ -663,80 +699,96 @@ fn handle_unlock_key(app: &mut App, key: KeyEvent) -> bool {
     false
 }
 
-/// Hasil dari `try_unlock` — menggantikan `bool` agar bisa bedakan 4 outcome.
-enum UnlockResult {
-    AlterOk,
-    PmOk,
-    NeedsMigration,
-    Error(String),
+/// Hasil komputasi KDF+dekripsi dari background thread — semua tipe ini Send.
+enum UnlockComputed {
+    AlterMode(KeyBundle),
+    PmMode { pm_entries: Vec<PmEntry>, pm_key: [u8; 32], vault: Box<[u8; vault::VAULT_V2_SIZE]> },
+    EmptyPm(Box<[u8; vault::VAULT_V2_SIZE]>),
+    NeedsMigration(KeyBundle),
+    Err(String),
 }
 
-fn try_unlock(app: &mut App) -> UnlockResult {
-    let bytes = match vault::read_vault_raw(&app.vault_path) {
-        Ok(b) => b,
-        Err(_) => return UnlockResult::Error("Vault tidak terbaca.".into()),
-    };
-
+/// Komputasi berat (KDF + dekripsi) — dipanggil dari spawn_blocking, tidak menyentuh App.
+fn compute_unlock(bytes: Vec<u8>, passphrase: &[u8]) -> UnlockComputed {
     match vault::detect_version(&bytes) {
         vault::VaultVersion::V1 => {
             let v1: [u8; vault::VAULT_SIZE] = match bytes.try_into() {
                 Ok(v) => v,
-                Err(_) => return UnlockResult::Error("Vault tidak valid.".into()),
+                Err(_) => return UnlockComputed::Err("Vault tidak valid.".into()),
             };
-            match vault::unseal(&v1, app.pass_input.as_bytes()) {
-                Ok(bundle) => {
-                    // Simpan bundle sementara untuk dipakai saat migrasi
-                    app.migration_bundle = Some(bundle);
-                    UnlockResult::NeedsMigration
-                }
-                Err(_) => UnlockResult::Error("Passphrase salah atau vault rusak.".into()),
+            match vault::unseal(&v1, passphrase) {
+                Ok(bundle) => UnlockComputed::NeedsMigration(bundle),
+                Err(_) => UnlockComputed::Err("Passphrase salah atau vault rusak.".into()),
             }
         }
-
         vault::VaultVersion::V2 => {
             let v2: [u8; vault::VAULT_V2_SIZE] = match bytes.try_into() {
                 Ok(v) => v,
-                Err(_) => return UnlockResult::Error("Vault tidak valid.".into()),
+                Err(_) => return UnlockComputed::Err("Vault tidak valid.".into()),
             };
-            match vault::open_v2(&v2, app.pass_input.as_bytes()) {
-                vault::VaultOpenResult::AlterMode(bundle) => {
-                    app.contacts_key = Some(contacts::derive_contacts_key(&bundle));
-                    app.keys = Some(build_self_keys(&bundle, None));
-                    refresh_invite(app);
-                    app.auth_error = None;
-                    load_contacts_into(app);
-                    inject_all_client_auth_keys(app);
-                    let has_restricted =
-                        app.contacts.iter().any(|c| c.tor_client_auth_pub.is_some());
-                    if app.tor.is_some() && has_restricted {
-                        trigger_tor_restart(app);
-                    }
-                    UnlockResult::AlterOk
-                }
-
+            match vault::open_v2(&v2, passphrase) {
+                vault::VaultOpenResult::AlterMode(bundle) => UnlockComputed::AlterMode(bundle),
                 vault::VaultOpenResult::PmMode { pm_entries, pm_key } => {
-                    app.pm_entries = pm_entries;
-                    let mut zk = zeroize::Zeroizing::new(pm_key);
-                    platform::try_mlock((&mut *zk).as_mut_ptr(), 32);
-                    app.pm_key = Some(zk);
-                    app.pm_vault_bytes = Some(Box::new(v2));
-                    app.pm_is_readonly = false;
-                    UnlockResult::PmOk
+                    UnlockComputed::PmMode { pm_entries, pm_key, vault: Box::new(v2) }
                 }
-
-                vault::VaultOpenResult::EmptyPm => {
-                    // Passphrase tidak dikenal → PM kosong, read-only
-                    app.pm_entries = Vec::new();
-                    app.pm_key = None;
-                    app.pm_vault_bytes = Some(Box::new(v2));
-                    app.pm_is_readonly = true;
-                    UnlockResult::PmOk
-                }
+                vault::VaultOpenResult::EmptyPm => UnlockComputed::EmptyPm(Box::new(v2)),
             }
         }
-
         vault::VaultVersion::Unknown => {
-            UnlockResult::Error("Format vault tidak dikenal.".into())
+            UnlockComputed::Err("Format vault tidak dikenal.".into())
+        }
+    }
+}
+
+/// Terapkan hasil KDF ke App — berjalan kembali di main thread setelah spawn_blocking selesai.
+fn apply_unlock_result(app: &mut App, computed: UnlockComputed) {
+    app.unlock_rx = None;
+    match computed {
+        UnlockComputed::AlterMode(bundle) => {
+            app.pass_input.zeroize();
+            app.contacts_key = Some(contacts::derive_contacts_key(&bundle));
+            app.keys = Some(build_self_keys(&bundle, None));
+            refresh_invite(app);
+            app.auth_error = None;
+            load_contacts_into(app);
+            inject_all_client_auth_keys(app);
+            let has_restricted = app.contacts.iter().any(|c| c.tor_client_auth_pub.is_some());
+            if app.tor.is_some() && has_restricted {
+                trigger_tor_restart(app);
+            }
+            app.init_step = 1;
+            app.init_start_tick = app.tick_count;
+            app.screen = Screen::Init;
+        }
+        UnlockComputed::PmMode { pm_entries, pm_key, vault } => {
+            app.pass_input.zeroize();
+            app.pm_entries = pm_entries;
+            let mut zk = zeroize::Zeroizing::new(pm_key);
+            platform::try_mlock((&mut *zk).as_mut_ptr(), 32);
+            app.pm_key = Some(zk);
+            app.pm_vault_bytes = Some(vault);
+            app.pm_is_readonly = false;
+            app.screen = Screen::PmMain;
+        }
+        UnlockComputed::EmptyPm(vault) => {
+            app.pass_input.zeroize();
+            app.pm_entries = Vec::new();
+            app.pm_key = None;
+            app.pm_vault_bytes = Some(vault);
+            app.pm_is_readonly = true;
+            app.screen = Screen::PmMain;
+        }
+        UnlockComputed::NeedsMigration(bundle) => {
+            // JANGAN zeroize pass_input — akan dipakai sebagai passphrase B saat migrasi
+            app.migration_bundle = Some(bundle);
+            app.auth_error = None;
+            app.migration_phase = 0;
+            app.screen = Screen::Migrate;
+        }
+        UnlockComputed::Err(msg) => {
+            app.pass_input.zeroize();
+            app.auth_error = Some(msg);
+            app.screen = Screen::Unlock;
         }
     }
 }
@@ -951,6 +1003,11 @@ fn do_migrate(app: &mut App) {
 // ─── Password Manager TUI handlers ───────────────────────────────────────
 
 fn handle_pm_main_key(app: &mut App, key: KeyEvent) -> bool {
+    // ── Modal backup codes aktif — routing ke handler tersendiri ────────────
+    if app.pm_codes_open {
+        return handle_pm_codes_key(app, key);
+    }
+
     // Mode pencarian aktif
     if app.pm_search_active {
         match key.code {
@@ -989,6 +1046,8 @@ fn handle_pm_main_key(app: &mut App, key: KeyEvent) -> bool {
             app.pm_add_username.clear();
             app.pm_add_password.clear();
             app.pm_add_field = 0;
+            app.pm_add_codes.clear();
+            app.pm_add_code_input.clear();
             app.auth_error = None;
             app.screen = Screen::PmAdd;
         }
@@ -1005,6 +1064,18 @@ fn handle_pm_main_key(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Char('d') => {
             app.set_notif_warn("Mode baca — tidak bisa hapus entri.");
+        }
+        KeyCode::Char('k') => {
+            // Buka modal backup codes untuk entry yang dipilih
+            let visible = pm_visible_entries(app);
+            if !visible.is_empty() {
+                app.pm_codes_open = true;
+                app.pm_codes_selected = 0;
+                app.pm_codes_add_mode = false;
+                app.pm_codes_input.clear();
+            } else {
+                app.set_notif_info("Pilih entri terlebih dahulu.");
+            }
         }
         KeyCode::Char('c') => {
             // Copy password ke clipboard
@@ -1033,9 +1104,9 @@ fn handle_pm_main_key(app: &mut App, key: KeyEvent) -> bool {
             let visible = pm_visible_entries(app);
             if !visible.is_empty() {
                 if app.pm_reveal_tick.is_some() {
-                    app.pm_reveal_tick = None; // sembunyikan
+                    app.pm_reveal_tick = None;
                 } else {
-                    app.pm_reveal_tick = Some(app.tick_count); // reveal 5 detik
+                    app.pm_reveal_tick = Some(app.tick_count);
                 }
             }
         }
@@ -1055,17 +1126,140 @@ fn handle_pm_main_key(app: &mut App, key: KeyEvent) -> bool {
     false
 }
 
+fn handle_pm_codes_key(app: &mut App, key: KeyEvent) -> bool {
+    let visible = pm_visible_entries(app);
+    if visible.is_empty() {
+        app.pm_codes_open = false;
+        return false;
+    }
+    let entry_idx = visible[app.pm_selected];
+
+    // ── Mode input tambah code baru ──────────────────────────────────────
+    if app.pm_codes_add_mode {
+        match key.code {
+            KeyCode::Esc => {
+                app.pm_codes_add_mode = false;
+                app.pm_codes_input.clear();
+            }
+            KeyCode::Enter => {
+                let raw = app.pm_codes_input.trim().to_string();
+                if raw.is_empty() {
+                    app.pm_codes_add_mode = false;
+                } else {
+                    let codes = app.pm_entries[entry_idx]
+                        .codes
+                        .get_or_insert_with(Vec::new);
+                    if codes.len() >= PM_CODES_MAX {
+                        app.set_notif_warn(format!("Maksimum {} codes per entri.", PM_CODES_MAX));
+                    } else {
+                        codes.push(BackupCode { code: raw, used: false });
+                        pm_save(app);
+                        let count = app.pm_entries[entry_idx]
+                            .codes.as_ref().map(|c| c.len()).unwrap_or(0);
+                        app.set_notif_success(format!("[✓] Code ditambahkan ({}/{})", count, PM_CODES_MAX));
+                    }
+                    app.pm_codes_input.clear();
+                    app.pm_codes_add_mode = false;
+                }
+            }
+            KeyCode::Backspace => { app.pm_codes_input.pop(); }
+            KeyCode::Char(c) => app.pm_codes_input.push(c),
+            _ => {}
+        }
+        return false;
+    }
+
+    // ── Navigasi & aksi di list codes ───────────────────────────────────
+    let codes_len = app.pm_entries[entry_idx]
+        .codes.as_ref().map(|c| c.len()).unwrap_or(0);
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.pm_codes_open = false;
+            app.pm_codes_input.clear();
+        }
+        KeyCode::Up => {
+            if app.pm_codes_selected > 0 {
+                app.pm_codes_selected -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if codes_len > 0 && app.pm_codes_selected + 1 < codes_len {
+                app.pm_codes_selected += 1;
+            }
+        }
+        KeyCode::Char('n') if !app.pm_is_readonly => {
+            if codes_len >= PM_CODES_MAX {
+                app.set_notif_warn(format!("Maksimum {} codes per entri.", PM_CODES_MAX));
+            } else {
+                app.pm_codes_add_mode = true;
+                app.pm_codes_input.clear();
+            }
+        }
+        KeyCode::Char('m') if !app.pm_is_readonly && codes_len > 0 => {
+            // Toggle used/unused pada code yang dipilih
+            let sel = app.pm_codes_selected;
+            if let Some(codes) = app.pm_entries[entry_idx].codes.as_mut() {
+                if sel < codes.len() {
+                    codes[sel].used = !codes[sel].used;
+                    let status = if codes[sel].used { "used" } else { "aktif" };
+                    pm_save(app);
+                    app.set_notif_success(format!("[✓] Code ditandai {status}."));
+                }
+            }
+        }
+        KeyCode::Char('y') if codes_len > 0 => {
+            // Copy code yang dipilih ke clipboard
+            let sel = app.pm_codes_selected;
+            let code_text = app.pm_entries[entry_idx]
+                .codes.as_ref()
+                .and_then(|c| c.get(sel))
+                .map(|bc| bc.code.clone());
+            if let Some(text) = code_text {
+                match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text)) {
+                    Ok(()) => app.set_notif_success("[✓] Code disalin ke clipboard"),
+                    Err(_) => app.set_notif_warn("Clipboard tidak tersedia"),
+                }
+            }
+        }
+        KeyCode::Char('d') if !app.pm_is_readonly && codes_len > 0 => {
+            // Hapus code yang dipilih
+            let sel = app.pm_codes_selected;
+            if let Some(codes) = app.pm_entries[entry_idx].codes.as_mut() {
+                if sel < codes.len() {
+                    codes.remove(sel);
+                    if codes.is_empty() {
+                        app.pm_entries[entry_idx].codes = None;
+                    }
+                    pm_save(app);
+                    app.set_notif_success("[✓] Code dihapus.");
+                }
+            }
+            if app.pm_codes_selected > 0
+                && app.pm_codes_selected >= app.pm_entries[entry_idx]
+                    .codes.as_ref().map(|c| c.len()).unwrap_or(0)
+            {
+                app.pm_codes_selected -= 1;
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
 fn handle_pm_add_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Esc => {
             app.pm_add_service.clear();
             app.pm_add_username.clear();
-            app.pm_add_password.clear();
+            app.pm_add_password.zeroize();
+            app.pm_add_codes.clear();
+            app.pm_add_code_input.clear();
             app.pm_add_field = 0;
             app.screen = Screen::PmMain;
         }
         KeyCode::Tab | KeyCode::Down => {
-            if app.pm_add_field < 2 {
+            if app.pm_add_field < 3 {
                 app.pm_add_field += 1;
             }
         }
@@ -1077,36 +1271,67 @@ fn handle_pm_add_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Backspace => match app.pm_add_field {
             0 => { app.pm_add_service.pop(); }
             1 => { app.pm_add_username.pop(); }
-            _ => { app.pm_add_password.pop(); }
+            2 => { app.pm_add_password.pop(); }
+            _ => { app.pm_add_code_input.pop(); }
         },
         KeyCode::Char(c) => match app.pm_add_field {
             0 => app.pm_add_service.push(c),
             1 => app.pm_add_username.push(c),
-            _ => app.pm_add_password.push(c),
+            2 => app.pm_add_password.push(c),
+            _ => app.pm_add_code_input.push(c),
         },
         KeyCode::Enter => {
             if app.pm_add_field < 2 {
                 app.pm_add_field += 1;
+            } else if app.pm_add_field == 2 {
+                // Dari password → lanjut ke step codes (opsional)
+                app.pm_add_field = 3;
             } else {
-                // Simpan entri baru
-                if app.pm_add_service.trim().is_empty() {
-                    app.set_notif_error("[!] Service tidak boleh kosong.");
+                // Step 4: backup codes
+                let raw = app.pm_add_code_input.trim().to_string();
+                if !raw.is_empty() && app.pm_add_codes.len() < PM_CODES_MAX {
+                    // Enter dengan isi → tambah code ke list, tunggu code berikutnya
+                    app.pm_add_codes.push(raw);
+                    app.pm_add_code_input.clear();
                 } else {
-                    let new_id = app.pm_entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
-                    let entry = PmEntry {
-                        id: new_id,
-                        service: app.pm_add_service.trim().to_string(),
-                        username: app.pm_add_username.trim().to_string(),
-                        password: app.pm_add_password.clone(),
-                    };
-                    app.pm_entries.push(entry);
-                    // Zeroize field password dari form
-                    app.pm_add_password.zeroize();
-                    app.pm_add_service.clear();
-                    app.pm_add_username.clear();
-                    app.pm_add_field = 0;
-                    pm_save(app);
-                    app.screen = Screen::PmMain;
+                    // Enter kosong → simpan entri
+                    if app.pm_add_service.trim().is_empty() {
+                        app.pm_add_field = 0;
+                        app.set_notif_error("[!] Service tidak boleh kosong.");
+                    } else {
+                        let new_id = app.pm_entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+                        let codes: Option<Vec<BackupCode>> = if app.pm_add_codes.is_empty() {
+                            None
+                        } else {
+                            Some(app.pm_add_codes.iter().map(|c| BackupCode {
+                                code: c.clone(), used: false,
+                            }).collect())
+                        };
+                        let codes_count = codes.as_ref().map(|c| c.len()).unwrap_or(0);
+                        let entry = PmEntry {
+                            id: new_id,
+                            service: app.pm_add_service.trim().to_string(),
+                            username: app.pm_add_username.trim().to_string(),
+                            password: app.pm_add_password.clone(),
+                            codes,
+                        };
+                        let svc_name = app.pm_add_service.trim().to_string();
+                        app.pm_entries.push(entry);
+                        app.pm_add_password.zeroize();
+                        app.pm_add_service.clear();
+                        app.pm_add_username.clear();
+                        app.pm_add_codes.clear();
+                        app.pm_add_code_input.clear();
+                        app.pm_add_field = 0;
+                        pm_save(app);
+                        let notif = if codes_count > 0 {
+                            format!("[✓] Entri '{}' + {} backup codes ditambahkan.", svc_name, codes_count)
+                        } else {
+                            format!("[✓] Entri '{}' ditambahkan.", svc_name)
+                        };
+                        app.set_notif_success(notif);
+                        app.screen = Screen::PmMain;
+                    }
                 }
             }
         }

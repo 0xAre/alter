@@ -19,10 +19,24 @@ const PM_JSON_LEN_PREFIX: usize = 4;
 /// Maksimum bytes yang tersedia untuk JSON entries.
 pub const PM_DATA_MAX: usize = PM_PLAINTEXT_SIZE - PM_JSON_LEN_PREFIX;
 
+/// Maksimum backup codes per entry — standar industri (GitHub, Google).
+pub const PM_CODES_MAX: usize = 10;
+
+/// Satu backup / recovery code.
+///
+/// "c" = code, "u" = used flag. Field pendek untuk hemat vault space.
+#[derive(Debug, Clone, Serialize, Deserialize, Zeroize)]
+pub struct BackupCode {
+    #[serde(rename = "c")]
+    pub code: String,
+    #[serde(rename = "u", default)]
+    pub used: bool,
+}
+
 /// Satu entri password manager.
 ///
 /// Nama field pendek di JSON (serde rename) untuk menghemat ruang di vault:
-/// "s" = service, "u" = username, "p" = password.
+/// "s" = service, "u" = username, "p" = password, "k" = backup codes.
 #[derive(Debug, Clone, Serialize, Deserialize, Zeroize)]
 pub struct PmEntry {
     pub id: u64,
@@ -32,6 +46,9 @@ pub struct PmEntry {
     pub username: String,
     #[serde(rename = "p")]
     pub password: String,
+    /// Backup / recovery codes — None jika entry tidak punya codes.
+    #[serde(rename = "k", skip_serializing_if = "Option::is_none", default)]
+    pub codes: Option<Vec<BackupCode>>,
 }
 
 /// Koleksi semua PM entries — disimpan di slot A vault v2.
@@ -100,8 +117,8 @@ mod tests {
     fn roundtrip_entries() {
         let store = PmStore {
             entries: vec![
-                PmEntry { id: 1, service: "github.com".into(), username: "alice".into(), password: "s3cr3t".into() },
-                PmEntry { id: 2, service: "protonmail.com".into(), username: "alice@pm.me".into(), password: "another".into() },
+                PmEntry { id: 1, service: "github.com".into(), username: "alice".into(), password: "s3cr3t".into(), codes: None },
+                PmEntry { id: 2, service: "protonmail.com".into(), username: "alice@pm.me".into(), password: "another".into(), codes: None },
             ],
         };
         let plain = store.to_plaintext().unwrap();
@@ -127,7 +144,7 @@ mod tests {
     fn plaintext_size_is_always_fixed() {
         // Berbeda jumlah entries → plaintext size tetap sama
         let s1 = PmStore::default();
-        let s2 = PmStore { entries: vec![PmEntry { id: 1, service: "x".into(), username: "y".into(), password: "z".into() }] };
+        let s2 = PmStore { entries: vec![PmEntry { id: 1, service: "x".into(), username: "y".into(), password: "z".into(), codes: None }] };
         assert_eq!(s1.to_plaintext().unwrap().len(), PM_PLAINTEXT_SIZE);
         assert_eq!(s2.to_plaintext().unwrap().len(), PM_PLAINTEXT_SIZE);
     }

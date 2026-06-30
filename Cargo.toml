@@ -1,6 +1,6 @@
 [package]
 name = "alter"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 # Dinaikkan dari 1.75 ke 1.89 di M2: arti-client 0.43.x (sesuai PRD) butuh rustc >= 1.89.
 rust-version = "1.89"
