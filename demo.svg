@@ -1,0 +1,150 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 500" width="860" height="500">
+<defs>
+  <style>
+    .mono { font-family: 'Cascadia Code','Fira Code','SF Mono','Courier New',monospace; }
+    @keyframes blink  { 0%,49%{opacity:1} 50%,100%{opacity:0} }
+    @keyframes appear { from{opacity:0} to{opacity:1} }
+    @keyframes pulse  { 0%,100%{opacity:1} 50%{opacity:.4} }
+    @keyframes scanline {
+      0%   { transform: translateY(-100%); }
+      100% { transform: translateY(500px); }
+    }
+    .cursor { animation: blink 1.1s step-end infinite; }
+    .tor    { animation: pulse 2.8s ease-in-out infinite; }
+    .dot    { animation: pulse 2.8s ease-in-out infinite 1.4s; }
+    .s0  { opacity:0; animation: appear .35s ease forwards .4s; }
+    .s1  { opacity:0; animation: appear .35s ease forwards 1.2s; }
+    .s2  { opacity:0; animation: appear .35s ease forwards 2.4s; }
+    .s3  { opacity:0; animation: appear .35s ease forwards 3.6s; }
+    .s4  { opacity:0; animation: appear .35s ease forwards 4.8s; }
+    .s5  { opacity:0; animation: appear .35s ease forwards 5.6s; }
+    .s6  { opacity:0; animation: appear .35s ease forwards 6.8s; }
+    .s7  { opacity:0; animation: appear .35s ease forwards 7.4s; }
+  </style>
+  <clipPath id="win"><rect width="860" height="500" rx="10"/></clipPath>
+  <!-- scanline gradient -->
+  <linearGradient id="scan" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0%"   stop-color="#7dcfff" stop-opacity="0"/>
+    <stop offset="50%"  stop-color="#7dcfff" stop-opacity=".03"/>
+    <stop offset="100%" stop-color="#7dcfff" stop-opacity="0"/>
+  </linearGradient>
+</defs>
+
+<!-- ── window shell ── -->
+<rect width="860" height="500" rx="10" fill="#1a1b26"/>
+<g clip-path="url(#win)">
+
+  <!-- title bar -->
+  <rect width="860" height="30" fill="#13141f"/>
+  <circle cx="18"  cy="15" r="6" fill="#f7768e" opacity=".85"/>
+  <circle cx="36"  cy="15" r="6" fill="#e0af68" opacity=".85"/>
+  <circle cx="54"  cy="15" r="6" fill="#9ece6a" opacity=".85"/>
+  <text class="mono" x="430" y="19" text-anchor="middle" font-size="11" fill="#414868">ALTER — encrypted terminal chat</text>
+
+  <!-- outer top border -->
+  <rect y="30" width="860" height="1" fill="#2a2d4a"/>
+
+  <!-- ── status bar ── -->
+  <rect y="31" width="860" height="26" fill="#13141f" opacity=".7"/>
+  <text class="mono" y="48" font-size="12">
+    <tspan x="12" fill="#2a2d4a">── ALTER ──</tspan>
+    <tspan class="tor" fill="#9ece6a"> ◉ ONLINE </tspan>
+    <tspan fill="#2a2d4a">───────────────────────────────────────────── id:</tspan>
+    <tspan fill="#7dcfff">a3f9c2</tspan>
+    <tspan fill="#2a2d4a"> ──</tspan>
+  </text>
+  <rect y="57" width="860" height="1" fill="#2a2d4a"/>
+
+  <!-- ── column headers ── -->
+  <rect y="58" width="860" height="24" fill="#111219"/>
+  <text class="mono" x="14" y="74" font-size="11" fill="#3b4261" letter-spacing=".8">CONTACTS</text>
+  <!-- vertical divider -->
+  <rect x="218" y="30" width="1" height="470" fill="#2a2d4a"/>
+  <!-- chat header -->
+  <text class="mono" x="230" y="74" font-size="11" fill="#3b4261">SESI  ·  </text>
+  <text class="mono" x="286" y="74" font-size="11" fill="#7dcfff">◎</text>
+  <text class="mono" x="300" y="74" font-size="11" fill="#c0caf5">Bob</text>
+  <circle class="dot" cx="840" cy="70" r="5" fill="#9ece6a"/>
+  <rect y="82" width="860" height="1" fill="#2a2d4a"/>
+
+  <!-- ── contacts list ── -->
+  <!-- selected -->
+  <rect y="83" width="218" height="22" fill="#1e2030"/>
+  <text class="mono" x="12" y="98" font-size="12" fill="#7dcfff">▸ ◎  Bob</text>
+  <!-- others -->
+  <text class="mono" x="12" y="120" font-size="12" fill="#3b4261">  ○  Alice</text>
+  <text class="mono" x="12" y="142" font-size="12" fill="#3b4261">  ○  Charlie</text>
+
+  <!-- ── chat messages ── -->
+  <!-- system -->
+  <text class="mono s0" x="230" y="100" font-size="12" fill="#414868">·  Sesi aman terbuka. Noise_IK terverifikasi.</text>
+
+  <!-- me: msg 1 -->
+  <text class="mono s1" x="230" y="124" font-size="12">
+    <tspan fill="#565f89">→  </tspan><tspan fill="#c0caf5">halo bro, aman kan ini?</tspan>
+  </text>
+
+  <!-- peer: msg 1 -->
+  <text class="mono s2" x="230" y="148" font-size="12">
+    <tspan fill="#7dcfff">←  </tspan><tspan fill="#c0caf5">aman. E2E Noise_IK, via Tor. zero trace.</tspan>
+  </text>
+
+  <!-- file transfer sent -->
+  <text class="mono s3" x="230" y="172" font-size="12">
+    <tspan fill="#565f89">·  </tspan><tspan fill="#e0af68">report.pdf</tspan><tspan fill="#565f89"> (2.3 MB) dikirim — SHA-256 verified ✓</tspan>
+  </text>
+
+  <!-- peer: reply message -->
+  <text class="mono s4" x="230" y="196" font-size="12">
+    <tspan fill="#7dcfff">←  </tspan><tspan fill="#9ece6a">↩ </tspan><tspan fill="#414868">"aman. E2E Noise_IK, via Tor..."</tspan>
+  </text>
+  <text class="mono s4" x="230" y="214" font-size="12">
+    <tspan fill="#7dcfff">    </tspan><tspan fill="#c0caf5">received. siap lanjut.</tspan>
+  </text>
+
+  <!-- me: reply -->
+  <text class="mono s5" x="230" y="238" font-size="12">
+    <tspan fill="#565f89">→  </tspan><tspan fill="#9ece6a">↩ </tspan><tspan fill="#414868">"received. siap lanjut."</tspan>
+  </text>
+  <text class="mono s5" x="230" y="256" font-size="12">
+    <tspan fill="#565f89">    </tspan><tspan fill="#c0caf5">oke siap. sampai nanti.</tspan>
+  </text>
+
+  <!-- peer: final -->
+  <text class="mono s6" x="230" y="280" font-size="12">
+    <tspan fill="#7dcfff">←  </tspan><tspan fill="#c0caf5">👍 stay safe bro.</tspan>
+  </text>
+
+  <!-- system: room closing -->
+  <text class="mono s7" x="230" y="304" font-size="12" fill="#414868">·  Peer meninggalkan room. Kunci sesi dibuang.</text>
+
+  <!-- ── reply context bar ── -->
+  <rect y="430" x="218" width="642" height="1" fill="#2a2d4a"/>
+  <rect y="431" x="218" width="642" height="22" fill="#111219"/>
+  <text class="mono s5" x="230" y="446" font-size="11" fill="#414868">↩ "received. siap lanjut."</text>
+
+  <!-- ── input row ── -->
+  <rect y="453" x="218" width="642" height="1" fill="#2a2d4a"/>
+  <text class="mono" x="230" y="470" font-size="12">
+    <tspan fill="#9ece6a">↩ </tspan><tspan fill="#c0caf5"> </tspan>
+  </text>
+  <text class="mono cursor" x="249" y="470" font-size="12" fill="#c0caf5">█</text>
+
+  <!-- ── bottom keybinds ── -->
+  <rect y="453" x="0" width="218" height="47" fill="#111219"/>
+  <rect y="476" width="860" height="1" fill="#2a2d4a"/>
+  <text class="mono" y="491" font-size="10" fill="#2a2d4a">
+    <tspan x="12">[PageUp/Down] scroll</tspan>
+    <tspan x="200">[r] reply</tspan>
+    <tspan x="270">[Ctrl+F] file</tspan>
+    <tspan x="360">[Esc] keluar</tspan>
+    <tspan x="450">[Ctrl+X]×2 panic wipe</tspan>
+  </text>
+
+  <!-- subtle scanline sweep -->
+  <rect y="0" width="860" height="80" fill="url(#scan)" opacity=".6">
+    <animateTransform attributeName="transform" type="translate" from="0,0" to="0,500" dur="4s" repeatCount="indefinite"/>
+  </rect>
+
+</g>
+</svg>

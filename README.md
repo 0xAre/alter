@@ -6,272 +6,224 @@
   ███████║██║     ██║   █████╗  ██████╔╝
   ██╔══██║██║     ██║   ██╔══╝  ██╔══██╗
   ██║  ██║███████╗██║   ███████╗██║  ██║
-  ╚═╝  ╚═╝╚══════╝╚═╝   ╚══════╝╚═╝  ╚═╝
 ```
 
-**Serverless · Encrypted · Sovereign**
+**No server. No trace. Just you and who you trust.**
 
-*Chat end-to-end terenkripsi tanpa server, tanpa akun, tanpa metadata.*
-
+[![Release](https://img.shields.io/badge/release-v0.5.1-5dd4d4?style=flat-square)](https://github.com/0xAre/alter/releases)
 [![Rust](https://img.shields.io/badge/Rust-1.89+-orange?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square)](LICENSE)
-[![Release](https://img.shields.io/github/v/release/0xAre/alter?style=flat-square&color=cyan)](https://github.com/0xAre/alter/releases)
 [![Build](https://img.shields.io/github/actions/workflow/status/0xAre/alter/release.yml?style=flat-square)](https://github.com/0xAre/alter/actions)
-[![PRD](https://img.shields.io/badge/Spec-PRD_v0.4-blueviolet?style=flat-square)](PRD-alter-v0.4.md)
 
 </div>
 
 ---
 
-## Apa itu ALTER?
-
-ALTER adalah aplikasi chat terminal yang berjalan **sepenuhnya peer-to-peer** — tidak ada server perantara, tidak ada akun, tidak ada metadata percakapan yang tersimpan di luar perangkatmu.
-
-Dua orang terhubung langsung via **LAN** atau **Tor**, diautentikasi dan dienkripsi menggunakan **Noise Protocol Framework** (IK pattern). Begitu salah satu pihak meninggalkan room, kunci sesi dibuang permanen — pesan lama tidak bisa dibaca ulang oleh siapapun, termasuk pengirimnya sendiri.
-
-> **Room-Bound Sync** — *Ephemeral by design, bukan by policy.*
-
-```
-┌─ ALTER ─── ◉ ONLINE ───────────────────────── id:29a40f ─┐
-│                                                            │
-│  CONTACTS         │  SESI  ·  ◎  Bob              ●       │
-│                   │                                        │
-│  ▸ ◎  Bob         │  ·  Sesi aman terbuka.                 │
-│    ○  Alice       │                                        │
-│                   │  →  halo, bro                          │
-│                   │  ←  haloo, aman ini?                   │
-│                   │  →  ya, E2E via Tor                    │
-│                   ├────────────────────────────────────────│
-│                   │  › ketik pesan...▏                     │
-└───────────────────┴────────────────────────────────────────┘
- [↑↓] pilih   [Enter] sesi   [a] tambah   [i] identitas   [q] keluar
-```
-
----
-
-## Fitur Utama
-
-| Fitur | Detail |
-|-------|--------|
-| 🔐 **Noise_IK Handshake** | `Noise_IK_25519_ChaChaPoly_BLAKE2s` — mutual auth + forward secrecy + identity hiding dalam satu protokol |
-| 🧅 **Tor Built-in** | Onion service persisten dijalankan langsung dari binary — tidak perlu install/jalankan Tor daemon terpisah |
-| 🌐 **LAN-first, Tor fallback** | Jika di satu jaringan → koneksi langsung (TCP). Jika lintas internet → otomatis fallback ke Tor |
-| 🔑 **Vault Terenkripsi (v2)** | Dual-slot 4096 byte — slot B: ALTER keypair, slot A: Password Manager decoy. Argon2id + ChaCha20-Poly1305. Tanpa magic bytes |
-| 👥 **Kontak Terenkripsi** | Daftar kontak tersimpan terenkripsi di disk (ChaCha20-Poly1305, key dari identity) |
-| 💨 **Zero Trace** | Semua pesan hanya di RAM. Session key di-`ZeroizeOnDrop` saat room ditutup |
-| 📟 **Terminal UI** | Antarmuka ratatui yang bersih, responsif, dengan spinner dan notifikasi real-time |
-| 🚫 **Tanpa Server** | Tidak ada backend, tidak ada API, tidak ada akun — murni P2P |
+<div align="center">
+  <img src="demo.svg" alt="ALTER demo" width="860"/>
+</div>
 
 ---
 
 ## Instalasi
 
-### Prasyarat
-
-- **Rust stable ≥ 1.89** — pasang via [rustup.rs](https://rustup.rs)
-- **Windows**: Visual Studio Build Tools (MSVC) — sudah terpasang jika Rust dipasang via rustup dengan MSVC host
-- **Linux/macOS**: toolchain C standar (`build-essential` / Xcode CLT)
-
-> Tidak butuh OpenSSL. Tidak butuh menjalankan daemon Tor terpisah. Semuanya bundled.
-
----
-
-### Option A: Download Binary (Tanpa Install Rust)
-
-Ambil binary siap pakai dari [**Releases**](https://github.com/0xAre/alter/releases):
-
-| Platform | File |
-|----------|------|
-| Windows x64 | `alter-x86_64-pc-windows-msvc.exe` |
-| Linux x64 | `alter-x86_64-unknown-linux-gnu` |
-| macOS Apple Silicon | `alter-aarch64-apple-darwin` |
-
-**Windows — installer satu baris:**
+**Windows** — satu baris, selesai:
 ```powershell
 irm https://raw.githubusercontent.com/0xAre/alter/main/install.ps1 | iex
 ```
-Tutup & buka ulang terminal, lalu ketik `alter`.
 
----
+**Linux / macOS:**
+```bash
+curl -sSfL https://raw.githubusercontent.com/0xAre/alter/main/install.sh | sh
+```
 
-### Option B: Cargo Install (Jika Rust Sudah Ada)
-
+**Cargo (jika Rust sudah ada):**
 ```bash
 cargo install --git https://github.com/0xAre/alter
 ```
 
-`alter` langsung tersedia di PATH via `~/.cargo/bin`. Tidak perlu setup tambahan.
+> Tidak butuh OpenSSL. Tidak butuh daemon Tor terpisah. Satu binary, langsung jalan.
 
 ---
 
-### Option C: Build dari Source
+## Apa itu ALTER?
 
-```bash
-git clone https://github.com/0xAre/alter
-cd alter
-cargo build --release
-# Binary: ./target/release/alter
-```
+Terminal chat yang bekerja tanpa server.
 
-Atau langsung install ke `~/.cargo/bin`:
-```bash
-cargo install --path .
-```
+Dua orang terhubung langsung — via LAN di satu jaringan, atau via **Tor** di mana saja di dunia. Setiap sesi dienkripsi end-to-end menggunakan **Noise Protocol (IK pattern)**. Saat salah satu keluar dari room, kunci sesi dibuang — tidak ada yang bisa membaca percakapan itu lagi, bahkan pengirimnya sendiri.
 
----
-
-## Pemakaian Cepat
-
-```bash
-alter             # Mode ONLINE (LAN + Tor) — default
-alter --offline   # Mode LAN murni (tanpa Tor, cocok untuk jaringan internal)
-```
-
-TUI muncul seketika — LAN langsung aktif, Tor di-bootstrap di latar belakang. Badge transport berubah dari `⌂ LOCAL` → `◉ ONLINE` saat Tor siap.
+<table>
+<tr>
+<td width="33%" valign="top">
+<b>Tanpa server</b><br><br>
+Tidak ada backend yang bisa diretas, disita, atau tumbang. Koneksi langsung peer-to-peer, selalu.
+</td>
+<td width="33%" valign="top">
+<b>Ephemeral</b><br><br>
+Pesan hanya ada di RAM. Kunci sesi dibuang saat room ditutup — riwayat tidak bisa dibaca ulang.
+</td>
+<td width="33%" valign="top">
+<b>Deniable</b><br><br>
+Passphrase berbeda membuka Password Manager biasa. Tidak ada cara membuktikan ALTER ada di vault yang sama.
+</td>
+</tr>
+</table>
 
 ---
 
-### Mulai Pertama Kali
+## Fitur
+
+**Noise_IK End-to-End** — mutual authentication + forward secrecy dalam satu handshake. Tidak bisa di-MITM tanpa private key peer.
+
+**Tor built-in** — ALTER menjalankan onion service sendiri. Tidak perlu install atau konfigurasi Tor terpisah.
+
+**LAN-first, Tor fallback** — di satu jaringan: koneksi langsung TCP. Lintas internet: lewat Tor otomatis.
+
+**Transfer file terenkripsi** — kirim file hingga 4 GB langsung lewat sesi. SHA-256 end-to-end. Gambar bisa dilihat inline. Tidak ada relay, tidak ada upload ke cloud.
+
+**Password Manager decoy** — satu vault, dua passphrase. Passphrase decoy membuka PM biasa. Plausible deniability bawaan.
+
+**Reply & scroll history** — balas pesan spesifik dengan kutipan. Scroll riwayat chat dengan PageUp/PageDown.
+
+**Panic wipe** — `Ctrl+Shift+X` dua kali dalam 3 detik: zeroize semua secret di RAM, exit seketika.
+
+<details>
+<summary>Selengkapnya: arsitektur kriptografi</summary>
+
+<br>
 
 ```
-1. Jalankan alter
-2. Set passphrase → identitas dan kunci kriptografi dibuat otomatis
-3. Tekan [i] → tampil invite code kamu
-4. Bagikan invite code ke peer via channel aman lain (Signal, kertas, dll)
-5. Tekan [a] → tempel invite code peer (+ spasi + nickname opsional)
-6. Pilih kontak → [Enter] → masuk room terenkripsi
+NOISE TRANSPORT
+  Noise_IK_25519_ChaChaPoly_BLAKE2s
+  ├─ Mutual authentication — kedua static key diverifikasi
+  ├─ Forward secrecy — ephemeral X25519 DH per sesi, dibuang setelah handshake
+  └─ Identity hiding — static key initiator dienkripsi dalam message pertama
+
+TRANSPORT
+  ├─ LAN : TCP direct via mDNS discovery
+  └─ Tor : onion service via arti-client (embedded, tanpa daemon)
+
+VAULT v2 (4096 B)
+  Argon2id KDF + ChaCha20-Poly1305
+  Dual-slot independen: Slot A (PM decoy) · Slot B (ALTER keys)
+  Tanpa header / magic bytes — indistinguishable from random data
 ```
 
-Kedua pihak harus menekan `Enter` ke kontak yang sama secara bersamaan. Role (Initiator/Responder) ditentukan otomatis dari perbandingan fingerprint — tidak perlu koordinasi manual.
+**Properti keamanan:**
+
+| Property | Status |
+|---|---|
+| Mutual authentication | ✓ Noise_IK — kedua pihak memverifikasi static key lawan |
+| Forward secrecy | ✓ Ephemeral X25519 DH per sesi |
+| Identity hiding | ✓ Static key initiator dienkripsi di message pertama |
+| Zero memory leak | ✓ `ZeroizeOnDrop` semua struct yang menyimpan secret |
+| Plausible deniability | ✓ Vault tanpa magic bytes, passphrase decoy membuka PM |
+| Encrypted contact list | ✓ Social graph dienkripsi di disk |
+
+> v0.5.1 — belum diaudit pihak ketiga. Gunakan dengan pertimbangan risiko yang sesuai.
+
+</details>
 
 ---
+
+## Mulai Pakai
+
+```
+1.  alter                       # jalankan — LAN aktif seketika, Tor di background
+2.  Tekan [i]                   # tampilkan invite code kamu
+3.  Bagikan ke peer             # via Signal, kertas, atau channel aman lainnya
+4.  Tekan [a] → paste invite    # tambah kontak peer (+ spasi + nickname opsional)
+5.  Pilih kontak → [Enter]      # buka room terenkripsi
+```
+
+> Kedua pihak perlu menekan `Enter` ke kontak yang sama. Role (Initiator/Responder) ditentukan otomatis dari fingerprint — tidak perlu koordinasi manual.
 
 ### Keybinding
 
 | Tombol | Konteks | Aksi |
 |--------|---------|------|
-| `↑` / `↓` | Kontak list | Pilih kontak |
-| `Enter` | Kontak list | Buka sesi |
-| `a` | Kontak list | Tambah kontak baru |
-| `r` | Kontak list | Ganti nama kontak (UX-01) |
-| `d` | Kontak list | Hapus kontak (minta konfirmasi) |
-| `i` | Mana saja | Tampilkan / tutup invite code |
+| `↑` / `↓` | Main | Pilih kontak |
+| `Enter` | Main | Buka sesi ke kontak terpilih |
+| `a` | Main | Tambah kontak baru (paste invite code) |
+| `r` | Main | Ganti nama kontak |
+| `d` | Main | Hapus kontak (minta konfirmasi) |
+| `i` | Mana saja | Tampil / tutup invite code |
 | `c` | Mana saja | Salin invite code ke clipboard |
-| `Enter` | Dalam room | Kirim pesan |
-| `Esc` | Dalam room | Keluar room (riwayat dibuang) |
-| `n` | PM list | Tambah entri baru (Password Manager) |
-| `d` | PM list | Hapus entri (minta konfirmasi) |
-| `q` / `Esc` | Kontak list | Keluar aplikasi |
-| `Ctrl+X` × 2 | Mana saja | Panic wipe — zeroize semua secret, exit |
-| `Ctrl+C` | Mana saja | Force quit |
+| `PageUp` / `PageDown` | Room | Scroll riwayat chat |
+| `r` | Room | Reply pesan (kutipan inline) |
+| `Ctrl+F` | Room | Kirim file |
+| `[S]` / `[L]` / `[T]` | File diterima | Simpan / Lihat inline / Tolak |
+| `Esc` | Room | Keluar room (riwayat dibuang) |
+| `Ctrl+Shift+X` × 2 | Mana saja | Panic wipe — zeroize semua secret, exit |
 
----
+<details>
+<summary>Opsi CLI lengkap</summary>
 
-### Opsi CLI
+<br>
 
 ```
-alter [opsi]            Jalankan TUI
-alter id [opsi]         Cetak invite code lalu keluar (untuk skrip/automasi)
+alter                 Jalankan TUI (mode default: online)
+alter id              Cetak invite code lalu keluar
 
-Opsi:
-  --vault <path>        Lokasi vault (default: ~/.alter/id.key)
-  --offline             Matikan Tor — LAN murni, cocok untuk jaringan internal
-  --add <invite>        Pra-muat satu kontak saat startup
-  --name <nickname>     Nickname untuk kontak --add
-  --listen <port>       Paksa mode responder, listen di port ini (testing)
-  --dial <ip:port>      Paksa mode initiator, dial langsung (testing)
-  -h, --help            Tampilkan bantuan
+  --vault <path>      Lokasi vault (default: ~/.alter/id.key)
+  --offline           LAN saja — matikan Tor
+  --add <invite>      Pra-muat kontak saat startup
+  --name <nickname>   Nickname untuk --add
+  --listen <port>     Force responder di port ini (untuk testing)
+  --dial <ip:port>    Force dial langsung (untuk testing)
+  -h, --help          Tampilkan bantuan
 ```
 
-**Passphrase via environment** (untuk automasi):
+Passphrase via environment (untuk skrip/automasi):
 ```bash
 ALTER_PASSPHRASE="passphraseku" alter id
 ```
 
----
-
-## Arsitektur Keamanan
-
-### Cryptographic Stack
-
-```
-┌─────────────────────────────────────────────────────┐
-│                    APPLICATION                       │
-├─────────────────────────────────────────────────────┤
-│  NOISE TRANSPORT                                     │
-│  Noise_IK_25519_ChaChaPoly_BLAKE2s                   │
-│  ├─ Mutual authentication (kedua identitas diverif.) │
-│  ├─ Forward secrecy (ephemeral DH tiap sesi)         │
-│  └─ Identity hiding (static key initiator dienkr.)  │
-├─────────────────────────────────────────────────────┤
-│  TRANSPORT                                           │
-│  ├─ LAN: TCP direct (mDNS discovery)                 │
-│  └─ Tor: Onion service via arti-client               │
-├─────────────────────────────────────────────────────┤
-│  IDENTITY VAULT (v2)                                 │
-│  Dual-slot 4096 B — Argon2id + ChaCha20-Poly1305     │
-│  Slot A: PM decoy · Slot B: ALTER keys               │
-│  Indistinguishable from random data (SEC-05)         │
-└─────────────────────────────────────────────────────┘
-```
-
-### Properti Keamanan (PRD v0.3 Tier 0)
-
-| Property | Implementasi |
-|----------|-------------|
-| **Mutual Auth** | Noise_IK — kedua pihak memverifikasi static key lawan |
-| **Forward Secrecy** | Ephemeral X25519 DH per sesi, dibuang setelah handshake |
-| **Identity Hiding** | Static key initiator dienkripsi (`es`) di message pertama |
-| **Fail Closed** | Jika identity mismatch → koneksi langsung diputus, tidak dilanjutkan |
-| **Zero Memory Leak** | `ZeroizeOnDrop` pada semua struct yang menyimpan secret material |
-| **Plausible Deniability** | Vault 4096 B tanpa header/magic — tidak bisa diidentifikasi tanpa passphrase. Passphrase decoy membuka Password Manager |
-| **Encrypted Contact List** | Social graph dienkripsi di disk — tidak plaintext |
-
-### Threat Model
-
-ALTER dirancang untuk:
-- ✅ Mengamankan konten percakapan dari network observer
-- ✅ Menyembunyikan identitas dari operator infrastruktur
-- ✅ Ephemeral sessions — tidak ada history yang bisa disita
-- ✅ Mutual authentication — tidak bisa di-MITM tanpa private key
-
-ALTER **tidak** dirancang untuk:
-- ❌ Perlindungan jika endpoint dikompromisikan
-- ❌ Anonimitas mutlak (traffic correlation attack via Tor relay tetap mungkin)
-- ❌ Perlindungan saat laptop hibernate (mlock tidak melindungi RAM dump ke disk)
-
-> ⚠️ **Status: v0.5.0 — belum diaudit pihak ketiga.** Gunakan dengan pertimbangan risiko yang sesuai.
+</details>
 
 ---
 
-## Status Pengembangan
+## Status — v0.5.1
 
 ```
-M0 ████████████ Fondasi: identity, vault, Noise_IK                    ✅ Done
-M1 ████████████ LAN MVP: mDNS, TCP, TUI, chat 1-on-1                  ✅ Done
-M2 ████████████ Jalur internet: Tor onion + LAN fallback               ✅ Done
-M3 ████████████ Hardening: padding, panic-wipe, process-name, mlock    ✅ Done
-M4 ████████████ Polish & audit (hidden passphrase, onboarding)         ✅ Done
-M5 ████████████ Presence privacy: Restricted Discovery, lyrebird       ✅ Done
-M6 ████████████ Password Manager decoy front (dual-slot vault v2)      ✅ Done
+M0  Fondasi: identity, vault, Noise_IK handshake           ✓
+M1  LAN MVP: mDNS, TCP, TUI, chat 1-on-1                   ✓
+M2  Internet: Tor onion service + LAN fallback              ✓
+M3  Hardening: padding, panic-wipe, mlock                   ✓
+M4  Polish & audit                                          ✓
+M5  Presence privacy: Restricted Discovery (SEC-13)         ✓
+M6  Password Manager decoy front (vault v2 dual-slot)       ✓
+FT  File transfer terenkripsi — hingga 4 GB (v0.5.1)        ✓
 ```
 
-### Changelog Terbaru
+<details>
+<summary>Changelog lengkap</summary>
 
-**v0.5.0** — Password Manager Decoy Front (M6) + async unlock
-- Vault v2 (4096 B): dual-slot independent — slot A (PM) + slot B (ALTER)
-- Password Manager TUI fungsional: tambah/lihat/hapus/cari entries
+<br>
+
+**v0.5.1** — File Transfer + UX
+- Transfer file terenkripsi (FT-01): SHA-256 end-to-end, chunked streaming, hingga 4 GB
+- Image preview inline via viuer (setelah terima file gambar, pilih [L])
+- Reply dengan kutipan: `r` di room untuk balas pesan spesifik
+- Scroll riwayat chat: PageUp/PageDown dengan 5-pesan per langkah
+- Warning auto-dismiss (8 detik), input length limit per konteks
+
+**v0.5.0** — Password Manager Decoy Front
+- Vault v2 (4096 B): dual-slot independen — slot A (PM decoy) + slot B (ALTER keys)
+- Password Manager TUI: tambah / lihat / hapus / cari entries
 - Backup codes per entry (maks 10, mark-as-used)
 - Async unlock dengan spinner (Argon2id ~500ms di background thread)
-- 9 test checklist vault v2 wajib (PRD v0.4 Bagian 5.4) — semua pass
+
+**v0.4.0** — Presence Privacy
+- Restricted Discovery (SEC-13): onion service hanya accessible ke kontak dengan client auth
+- Tor client auth x25519 terintegrasi ke invite code v2
+
+</details>
 
 ---
 
 ## Kontribusi
 
-Lihat [CONTRIBUTING.md](CONTRIBUTING.md) untuk panduan lengkap.
-
-Secara singkat:
 1. Fork → buat branch dari `main`
 2. Buat perubahan, pastikan `cargo test` hijau dan `cargo clippy` bersih
 3. Commit dengan format [Conventional Commits](https://www.conventionalcommits.org/)
@@ -279,18 +231,10 @@ Secara singkat:
 
 ---
 
-## Lisensi
-
-ALTER dirilis di bawah **GNU General Public License v3.0** — lihat [LICENSE](LICENSE) untuk teks lengkapnya.
-
-Singkatnya: bebas digunakan, dipelajari, dan dimodifikasi. Fork dan distribusi wajib tetap GPL-3.0 dan open source.
-
----
-
 <div align="center">
 
 *"Privacy is not about having something to hide — it's about having something to protect."*
 
-**[Releases](https://github.com/0xAre/alter/releases) · [Issues](https://github.com/0xAre/alter/issues) · [PRD](PRD-alter-v0.3.md)**
+[Releases](https://github.com/0xAre/alter/releases) · [Issues](https://github.com/0xAre/alter/issues) · [GPL-3.0](LICENSE)
 
 </div>
